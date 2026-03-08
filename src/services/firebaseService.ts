@@ -279,3 +279,39 @@ export async function getUserSessions(userId: string, limit = 10): Promise<Forma
     .get();
   return snapshot.docs.map((doc) => formatSessionResponse(doc.data() as unknown as SessionData));
 }
+
+export async function getAllUserSessions(userId: string, batchSize = 200): Promise<FormattedSession[]> {
+  const database = await initFirebase();
+  if (usingFallback) {
+    const sessions: FormattedSession[] = [];
+    for (const [key, data] of memoryStore) {
+      if (!key.startsWith("sessions/")) continue;
+      const d = data as unknown as SessionData;
+      if (d.userId !== userId && (userId !== "anonymous" || d.userId != null)) continue;
+      sessions.push(formatSessionResponse(d));
+    }
+    sessions.sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+    return sessions;
+  }
+
+  const out: FormattedSession[] = [];
+  let cursor: admin.firestore.QueryDocumentSnapshot | null = null;
+
+  while (true) {
+    let query = (database as admin.firestore.Firestore)
+      .collection("sessions")
+      .where("userId", "==", userId)
+      .orderBy("createdAt", "asc")
+      .limit(batchSize);
+
+    if (cursor) query = query.startAfter(cursor);
+
+    const snapshot = await query.get();
+    if (snapshot.empty) break;
+    out.push(...snapshot.docs.map((doc) => formatSessionResponse(doc.data() as unknown as SessionData)));
+    cursor = snapshot.docs[snapshot.docs.length - 1] ?? null;
+    if (snapshot.size < batchSize) break;
+  }
+
+  return out;
+}

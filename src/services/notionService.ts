@@ -2,12 +2,62 @@ import { Client } from "@notionhq/client";
 
 const notion = process.env.NOTION_API_KEY ? new Client({ auth: process.env.NOTION_API_KEY }) : null;
 
+/** Notion rich_text text.content must be ≤ 2000 chars. Return array of rich_text items. */
+const NOTION_TEXT_MAX = 2000;
+function toRichText(content: string): { type: "text"; text: { content: string } }[] {
+  if (content.length <= NOTION_TEXT_MAX) {
+    return [{ type: "text", text: { content } }];
+  }
+  const out: { type: "text"; text: { content: string } }[] = [];
+  for (let i = 0; i < content.length; i += NOTION_TEXT_MAX) {
+    out.push({ type: "text", text: { content: content.slice(i, i + NOTION_TEXT_MAX) } });
+  }
+  return out;
+}
+
 export interface SyncSessionData {
   title?: string;
+  ideaDetails?: string;
+  agentReply?: string;
+  ideaConversation?: { role: "user" | "assistant"; content: string }[];
   conceptMap?: Record<string, string[]>;
   feasibilitySignal?: number | null;
-  messages?: { role: string; content?: string }[];
   tags?: { name: string }[];
+}
+
+function toMermaidConceptMap(conceptMap: Record<string, string[]>): string {
+  const entries = Object.entries(conceptMap).filter(([k]) => String(k).trim().length > 0);
+  if (entries.length === 0) return "graph TD\n  A[No concepts extracted]";
+
+  const lines: string[] = ["graph TD"];
+  const conceptIds = new Map<string, string>();
+  const termIds = new Map<string, string>();
+  let conceptCounter = 1;
+  let termCounter = 1;
+
+  const esc = (s: string): string => s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+
+  for (const [conceptRaw, termsRaw] of entries) {
+    const concept = conceptRaw.trim();
+    const conceptId = `C${conceptCounter++}`;
+    conceptIds.set(concept, conceptId);
+    lines.push(`  ${conceptId}["${esc(concept)}"]`);
+
+    for (const t of Array.isArray(termsRaw) ? termsRaw : []) {
+      const term = String(t).trim();
+      if (!term) continue;
+      const termKey = term.toLowerCase();
+      let termId = termIds.get(termKey);
+      if (!termId) {
+        termId = `T${termCounter++}`;
+        termIds.set(termKey, termId);
+        lines.push(`  ${termId}["${esc(term)}"]`);
+      }
+      lines.push(`  ${conceptId} --> ${termId}`);
+    }
+  }
+
+  return lines.join("\n");
 }
 
 export async function syncSessionToNotion(sessionData: SyncSessionData): Promise<{ id: string } | null> {
@@ -17,9 +67,11 @@ export async function syncSessionToNotion(sessionData: SyncSessionData): Promise
   }
 
   const title = sessionData.title ?? `Mirror Mind - ${new Date().toISOString().slice(0, 10)}`;
+  const ideaDetails = (sessionData.ideaDetails ?? "").trim();
+  const agentReply = (sessionData.agentReply ?? "").trim();
+  const ideaConversation = (sessionData.ideaConversation ?? []).filter((m) => (m.content ?? "").trim().length > 0);
   const conceptMap = sessionData.conceptMap ?? {};
   const feasibilitySignal = sessionData.feasibilitySignal;
-  const messages = sessionData.messages ?? [];
   const tags = sessionData.tags ?? [];
 
   const feasibilityPercent =
@@ -27,28 +79,57 @@ export async function syncSessionToNotion(sessionData: SyncSessionData): Promise
 
   const children: Record<string, unknown>[] = [];
 
-  if (messages.length > 0) {
+  if (ideaDetails) {
     children.push({
       object: "block",
       type: "heading_2",
-      heading_2: { rich_text: [{ text: { content: "💬 Ideas & conversation" } }] },
+      heading_2: { rich_text: [{ text: { content: "1) Idea details" } }] },
     });
-    for (const msg of messages) {
-      const who = msg.role === "user" ? "You" : "Mirror Mind";
-      const content = (msg.content ?? "").slice(0, 2000);
-      if (!content) continue;
+    children.push({
+      object: "block",
+      type: "paragraph",
+      paragraph: { rich_text: toRichText(ideaDetails) },
+    });
+  }
+
+  if (ideaConversation.length > 0) {
+    children.push({
+      object: "block",
+      type: "heading_2",
+      heading_2: { rich_text: [{ text: { content: "2) Idea conversation" } }] },
+    });
+    for (const msg of ideaConversation) {
+      const speaker = msg.role === "user" ? "You" : "Mirror Mind";
+      children.push({
+        object: "block",
+        type: "heading_3",
+        heading_3: { rich_text: [{ text: { content: speaker } }] },
+      });
       children.push({
         object: "block",
         type: "paragraph",
-        paragraph: { rich_text: [{ type: "text", text: { content: `${who}: ${content}` } }] },
+        paragraph: { rich_text: toRichText(msg.content.trim()) },
       });
     }
+  }
+
+  if (agentReply) {
+    children.push({
+      object: "block",
+      type: "heading_2",
+      heading_2: { rich_text: [{ text: { content: "3) Agent response (latest)" } }] },
+    });
+    children.push({
+      object: "block",
+      type: "paragraph",
+      paragraph: { rich_text: toRichText(agentReply) },
+    });
   }
 
   children.push({
     object: "block",
     type: "heading_2",
-    heading_2: { rich_text: [{ text: { content: "🗺️ Concept map" } }] },
+    heading_2: { rich_text: [{ text: { content: "4) Concept map" } }] },
   });
   if (Object.keys(conceptMap).length > 0) {
     for (const [concept, terms] of Object.entries(conceptMap)) {
@@ -56,13 +137,26 @@ export async function syncSessionToNotion(sessionData: SyncSessionData): Promise
       children.push({
         object: "block",
         type: "paragraph",
-        paragraph: { rich_text: [{ text: { content: line } }] },
+        paragraph: { rich_text: toRichText(line) },
       });
     }
+    const conceptMapJson = JSON.stringify(conceptMap, null, 2);
     children.push({
       object: "block",
       type: "code",
-      code: { language: "json", rich_text: [{ text: { content: JSON.stringify(conceptMap, null, 2) } }] },
+      code: { language: "json", rich_text: toRichText(conceptMapJson) },
+    });
+
+    children.push({
+      object: "block",
+      type: "heading_3",
+      heading_3: { rich_text: [{ text: { content: "Mermaid diagram code" } }] },
+    });
+    const mermaid = toMermaidConceptMap(conceptMap);
+    children.push({
+      object: "block",
+      type: "code",
+      code: { language: "plain text", rich_text: toRichText(mermaid) },
     });
   } else {
     children.push({
@@ -75,7 +169,7 @@ export async function syncSessionToNotion(sessionData: SyncSessionData): Promise
   children.push({
     object: "block",
     type: "heading_2",
-    heading_2: { rich_text: [{ text: { content: "✅ Feasibility" } }] },
+    heading_2: { rich_text: [{ text: { content: "5) Feasibility" } }] },
   });
   children.push({
     object: "block",

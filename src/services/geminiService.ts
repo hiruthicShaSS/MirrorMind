@@ -30,6 +30,7 @@ CRITICAL: You MUST end your reply with a single line of valid JSON (no markdown,
 {"conceptMap": {"Core Idea": ["sub idea 1", "sub idea 2"], "Tech": ["stack", "APIs"]}, "feasibilitySignal": 0.7}
 Rules for the JSON:
 - conceptMap: object with string keys (concept names) and array values (related terms). Always include at least 2 concepts.
+- Every concept must include at least 2 related terms; do not return an empty conceptMap.
 - feasibilitySignal: number between 0 and 1.
 - Optional: "roughWeeks": number for MVP estimate.
 Output the JSON on its own line at the very end.`;
@@ -46,56 +47,130 @@ function buildContents(sessionContext: SessionContextMessage[], userInput: strin
 }
 
 export function parseStructuredResponse(fullText: string): { conceptMap: Record<string, string[]>; feasibilitySignal: number | null } {
-  let conceptMap: Record<string, string[]> = {};
-  let feasibilitySignal: number | null = null;
+  const parseTerms = (value: unknown): string[] => {
+    if (Array.isArray(value)) return value.map((x) => String(x).trim()).filter(Boolean);
+    if (typeof value === "string") return value.split(",").map((x) => x.trim()).filter(Boolean);
+    return [];
+  };
 
-  const normalize = (obj: unknown): Record<string, string[]> => {
-    if (!obj || typeof obj !== "object" || Array.isArray(obj)) return {};
+  const normalizeConceptMap = (obj: unknown): Record<string, string[]> => {
+    if (!obj) return {};
+
+    if (typeof obj === "object" && !Array.isArray(obj)) {
+      const out: Record<string, string[]> = {};
+      for (const [k, v] of Object.entries(obj)) {
+        const key = String(k).trim();
+        if (!key) continue;
+        out[key] = parseTerms(v);
+      }
+      if (Object.keys(out).length > 0) return out;
+    }
+
+    if (Array.isArray(obj)) {
+      const out: Record<string, string[]> = {};
+      for (const item of obj) {
+        if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+        const rec = item as Record<string, unknown>;
+        const key = String(rec.concept ?? rec.name ?? rec.title ?? "").trim();
+        if (!key) continue;
+        out[key] = parseTerms(rec.terms ?? rec.related ?? rec.keywords ?? rec.subConcepts);
+      }
+      if (Object.keys(out).length > 0) return out;
+    }
+
+    return {};
+  };
+
+  const normalizeFeasibility = (value: unknown): number | null => {
+    if (typeof value !== "number" || Number.isNaN(value)) return null;
+    const normalized = value > 1 ? value / 100 : value;
+    return Math.max(0, Math.min(1, normalized));
+  };
+
+  const hydrate = (raw: unknown): { conceptMap: Record<string, string[]>; feasibilitySignal: number | null } => {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      return { conceptMap: {}, feasibilitySignal: null };
+    }
+    const rec = raw as Record<string, unknown>;
+    const conceptMap = normalizeConceptMap(rec.conceptMap ?? rec.concepts ?? rec.mindMap ?? rec.map ?? rec.graph);
+    const feasibilitySignal = normalizeFeasibility(rec.feasibilitySignal ?? rec.feasibility ?? rec.score);
+    return { conceptMap, feasibilitySignal };
+  };
+
+  const tryJson = (text: string): { conceptMap: Record<string, string[]>; feasibilitySignal: number | null } | null => {
+    try {
+      return hydrate(JSON.parse(text));
+    } catch {
+      return null;
+    }
+  };
+
+  const parseConceptMapFromText = (text: string): Record<string, string[]> => {
     const out: Record<string, string[]> = {};
-    for (const [k, v] of Object.entries(obj)) {
-      const key = String(k).trim();
-      if (!key) continue;
-      out[key] = Array.isArray(v) ? v.map((x) => String(x).trim()).filter(Boolean) : [];
+    const lines = (text || "").split("\n");
+    for (const raw of lines) {
+      const line = raw.trim().replace(/^[\-\*\d\.\)\s]+/, "");
+      if (!line || !line.includes(":")) continue;
+      const idx = line.indexOf(":");
+      const key = line.slice(0, idx).trim();
+      const rhs = line.slice(idx + 1).trim();
+      if (!key || !rhs) continue;
+      const terms = rhs
+        .split(/[,;|]/)
+        .map((s) => s.trim())
+        .filter(Boolean);
+      if (terms.length >= 2) out[key] = terms;
     }
     return out;
   };
+
+  const fencedRegex = /```(?:json)?\s*([\s\S]*?)```/gi;
+  const fencedBlocks: string[] = [];
+  let fenceMatch: RegExpExecArray | null = fencedRegex.exec(fullText || "");
+  while (fenceMatch) {
+    fencedBlocks.push((fenceMatch[1] ?? "").trim());
+    fenceMatch = fencedRegex.exec(fullText || "");
+  }
+  for (let i = fencedBlocks.length - 1; i >= 0; i--) {
+    const parsed = tryJson(fencedBlocks[i]);
+    if (parsed && (Object.keys(parsed.conceptMap).length > 0 || parsed.feasibilitySignal != null)) return parsed;
+  }
 
   const lines = (fullText || "").split("\n").map((l) => l.trim()).filter(Boolean);
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = lines[i];
     if (!line.startsWith("{")) continue;
-    try {
-      const parsed = JSON.parse(line) as { conceptMap?: unknown; feasibilitySignal?: number };
-      if (parsed.conceptMap != null) conceptMap = normalize(parsed.conceptMap);
-      if (typeof parsed.feasibilitySignal === "number") {
-        feasibilitySignal = Math.max(0, Math.min(1, parsed.feasibilitySignal));
-      }
-      if (Object.keys(conceptMap).length > 0 || feasibilitySignal != null) {
-        return { conceptMap, feasibilitySignal };
-      }
-    } catch {
-      // ignore
-    }
+    const parsed = tryJson(line);
+    if (parsed && (Object.keys(parsed.conceptMap).length > 0 || parsed.feasibilitySignal != null)) return parsed;
   }
 
-  const lastBrace = fullText.lastIndexOf("{");
-  if (lastBrace !== -1) {
-    const rest = fullText.slice(lastBrace);
-    const end = rest.indexOf("}");
-    if (end !== -1) {
-      try {
-        const parsed = JSON.parse(rest.slice(0, end + 1)) as { conceptMap?: unknown; feasibilitySignal?: number };
-        if (parsed.conceptMap != null) conceptMap = normalize(parsed.conceptMap);
-        if (typeof parsed.feasibilitySignal === "number") {
-          feasibilitySignal = Math.max(0, Math.min(1, parsed.feasibilitySignal));
+  const candidates: string[] = [];
+  for (let i = 0; i < fullText.length; i++) {
+    if (fullText[i] !== "{") continue;
+    let depth = 0;
+    for (let j = i; j < fullText.length; j++) {
+      const ch = fullText[j];
+      if (ch === "{") depth++;
+      if (ch === "}") {
+        depth--;
+        if (depth === 0) {
+          candidates.push(fullText.slice(i, j + 1));
+          break;
         }
-      } catch {
-        // ignore
       }
     }
   }
+  for (let i = candidates.length - 1; i >= 0; i--) {
+    const parsed = tryJson(candidates[i]);
+    if (parsed && (Object.keys(parsed.conceptMap).length > 0 || parsed.feasibilitySignal != null)) return parsed;
+  }
 
-  return { conceptMap, feasibilitySignal };
+  const fallbackConceptMap = parseConceptMapFromText(fullText || "");
+  if (Object.keys(fallbackConceptMap).length > 0) {
+    return { conceptMap: fallbackConceptMap, feasibilitySignal: null };
+  }
+
+  return { conceptMap: {}, feasibilitySignal: null };
 }
 
 function isQuotaError(err: unknown): boolean {

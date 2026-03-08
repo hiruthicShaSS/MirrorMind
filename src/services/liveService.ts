@@ -93,6 +93,7 @@ function isModelNotFoundOrUnsupported(reason?: string): boolean {
 
 export async function connectLiveSession(callbacks: LiveSessionCallbacks): Promise<{
   sendText: (text: string, turnComplete?: boolean) => void;
+  /** Send raw PCM audio (base64). Mime type will be normalized to what Gemini expects. */
   sendAudio: (base64Data: string, mimeType?: string) => void;
   close: () => void;
 }> {
@@ -242,26 +243,41 @@ export async function connectLiveSession(callbacks: LiveSessionCallbacks): Promi
     try {
       await openedPromise;
       return {
-    sendText: async (text: string, turnComplete = true) => {
-      if (sessionClosed) throw new Error("Live connection closed. Reconnect to try another model.");
-      await readyPromise;
-      (session as { sendClientContent?: (opts: unknown) => void }).sendClientContent?.({
-        turns: [{ role: "user", parts: [{ text }] }],
-        turnComplete,
-      });
-    },
-    sendAudio: async (base64Data: string, mimeType = "audio/pcm;rate=16000") => {
-      if (sessionClosed) throw new Error("Live connection closed. Reconnect to try another model.");
-      await readyPromise;
-      (session as { sendRealtimeInput?: (opts: unknown) => void }).sendRealtimeInput?.({
-        audio: { data: base64Data, mimeType },
-      });
-    },
-    close: () => {
-      setClosed();
-      (session as { close?: () => void }).close?.();
-    },
-  };
+        sendText: async (text: string, turnComplete = true) => {
+          if (sessionClosed) throw new Error("Live connection closed. Reconnect to try another model.");
+          await readyPromise;
+          (session as { sendClientContent?: (opts: unknown) => void }).sendClientContent?.({
+            turns: [{ role: "user", parts: [{ text }] }],
+            turnComplete,
+          });
+        },
+        sendAudio: async (base64Data: string, mimeType = "audio/pcm;rate=16000") => {
+          if (sessionClosed) throw new Error("Live connection closed. Reconnect to try another model.");
+          await readyPromise;
+          // Gemini supports 'audio/pcm' or 'audio/pcm;rate=xxxxx'. Strip unsupported params like ';channels=1'.
+          const normalizedMime = (() => {
+            const raw = mimeType ?? "audio/pcm;rate=16000";
+            const parts = raw.split(";").map(p => p.trim()).filter(Boolean);
+            if (parts.length === 0) return "audio/pcm";
+            const base = parts[0] || "audio/pcm";
+            const ratePart = parts.find(p => p.toLowerCase().startsWith("rate="));
+            return ratePart ? `${base};${ratePart}` : base;
+          })();
+          const live = session as { sendRealtimeInput?: (opts: unknown) => void };
+          // First send the audio chunk...
+          live.sendRealtimeInput?.({
+            audio: { data: base64Data, mimeType: normalizedMime },
+          });
+          // ...then tell the server the audio stream ended so it can respond.
+          live.sendRealtimeInput?.({
+            audioStreamEnd: true,
+          });
+        },
+        close: () => {
+          setClosed();
+          (session as { close?: () => void }).close?.();
+        },
+      };
     } catch (err) {
       lastError = err instanceof Error ? err : new Error(String(err));
       (session as { close?: () => void }).close?.();

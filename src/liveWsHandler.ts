@@ -14,6 +14,7 @@ import {
   updateConceptMap,
   updateFeasibilitySignal,
 } from "./services/firebaseService";
+import { upsertKnowledgeGraphFromConceptMap } from "./services/knowledgeGraphService";
 
 const allowAnonymous =
   process.env.ALLOW_ANONYMOUS_AGENT === "1" || process.env.NODE_ENV === "development";
@@ -98,7 +99,14 @@ export function attachLiveWs(ws: WebSocket, req: IncomingMessage): void {
             if (!sessionId) return;
             try {
               await appendMessage(sessionId, "assistant", fullText);
-              await updateConceptMap(sessionId, conceptMap);
+              if (conceptMap && Object.keys(conceptMap).length > 0) {
+                await updateConceptMap(sessionId, conceptMap);
+                await upsertKnowledgeGraphFromConceptMap({
+                  userId,
+                  sessionId,
+                  conceptMap,
+                });
+              }
               if (feasibilitySignal != null) {
                 await updateFeasibilitySignal(sessionId, feasibilitySignal);
               }
