@@ -98,7 +98,9 @@ export function attachLiveWs(ws: WebSocket, req: IncomingMessage): void {
             if (!sessionId) return;
             try {
               await appendMessage(sessionId, "assistant", fullText);
-              await updateConceptMap(sessionId, conceptMap);
+              if (conceptMap && Object.keys(conceptMap).length > 0) {
+                await updateConceptMap(sessionId, conceptMap);
+              }
               if (feasibilitySignal != null) {
                 await updateFeasibilitySignal(sessionId, feasibilitySignal);
               }

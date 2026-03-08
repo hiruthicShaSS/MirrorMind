@@ -18,6 +18,69 @@ function sessionIdParam(req: Request): string {
   return Array.isArray(p) ? p[0] ?? "" : p ?? "";
 }
 
+function extractLatestUserIdea(messages: { role: string; content?: string }[] = []): string {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    if (msg?.role !== "user") continue;
+    const content = (msg.content ?? "").trim();
+    if (content) return content;
+  }
+  return "";
+}
+
+function extractLatestAssistantReply(messages: { role: string; content?: string }[] = []): string {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    if (msg?.role !== "assistant") continue;
+    const content = (msg.content ?? "").trim();
+    if (content) return content;
+  }
+  return "";
+}
+
+function stripTrailingJsonLine(text: string): string {
+  const lines = (text || "").split("\n");
+  while (lines.length > 0) {
+    const last = (lines[lines.length - 1] ?? "").trim();
+    if (!last) {
+      lines.pop();
+      continue;
+    }
+    if (!last.startsWith("{")) break;
+    try {
+      JSON.parse(last);
+      lines.pop();
+      break;
+    } catch {
+      break;
+    }
+  }
+  return lines.join("\n").trim();
+}
+
+function hasConceptMapData(map: Record<string, string[]> | null | undefined): boolean {
+  return !!map && typeof map === "object" && Object.keys(map).length > 0;
+}
+
+function latestIdeaConversation(messages: { role: string; content?: string }[] = []): { role: "user" | "assistant"; content: string }[] {
+  const latestUserIdx = [...messages].map((m) => m.role).lastIndexOf("user");
+  if (latestUserIdx < 0) return [];
+  const userMsg = (messages[latestUserIdx]?.content ?? "").trim();
+  if (!userMsg) return [];
+
+  let assistantMsg = "";
+  for (let i = latestUserIdx + 1; i < messages.length; i++) {
+    const m = messages[i];
+    if (m?.role !== "assistant") continue;
+    assistantMsg = stripTrailingJsonLine((m.content ?? "").trim());
+    if (assistantMsg) break;
+  }
+
+  const out: { role: "user" | "assistant"; content: string }[] = [{ role: "user", content: userMsg }];
+  if (assistantMsg) out.push({ role: "assistant", content: assistantMsg });
+  return out;
+}
+
 router.post("/sessions", async (req: Request & { userId?: string }, res: Response): Promise<void> => {
   try {
     const userId = req.userId ?? null;
@@ -96,19 +159,25 @@ router.post(
         }
 
         const { conceptMap, feasibilitySignal } = parseStructuredResponse(fullResponse);
-        await updateConceptMap(sid, conceptMap);
+        if (hasConceptMapData(conceptMap)) {
+          await updateConceptMap(sid, conceptMap);
+        }
         if (feasibilitySignal != null) {
           await updateFeasibilitySignal(sid, feasibilitySignal);
         }
         await appendMessage(sid, "assistant", fullResponse);
 
         if (process.env.NOTION_API_KEY && process.env.NOTION_DATABASE_ID) {
-          const updatedSession = await getSession(sid);
           await syncSessionToNotion({
             title: `Mirror Mind - ${new Date().toLocaleString()}`,
+            ideaDetails: userInput,
+            agentReply: stripTrailingJsonLine(fullResponse),
+            ideaConversation: [
+              { role: "user", content: userInput },
+              { role: "assistant", content: stripTrailingJsonLine(fullResponse) },
+            ],
             conceptMap,
             feasibilitySignal,
-            messages: updatedSession?.messages ?? [],
             tags: [{ name: "mirror-mind" }],
           }).catch((e: Error) => console.warn("Notion sync skipped:", e.message));
         }
@@ -221,11 +290,18 @@ router.post(
         res.status(403).json({ error: "Unauthorized" });
         return;
       }
+      const latestAssistantReply = extractLatestAssistantReply(session.messages ?? []);
+      let conceptMapForSync = session.conceptMap ?? {};
+      if (!hasConceptMapData(conceptMapForSync) && latestAssistantReply) {
+        conceptMapForSync = parseStructuredResponse(latestAssistantReply).conceptMap;
+      }
       const page = await syncSessionToNotion({
         title: `Mirror Mind - ${sessionId.slice(0, 8)} - ${new Date().toLocaleString()}`,
-        conceptMap: session.conceptMap ?? {},
+        ideaDetails: extractLatestUserIdea(session.messages ?? []),
+        agentReply: stripTrailingJsonLine(latestAssistantReply),
+        ideaConversation: latestIdeaConversation(session.messages ?? []),
+        conceptMap: conceptMapForSync,
         feasibilitySignal: session.feasibilitySignal,
-        messages: session.messages ?? [],
         tags: [{ name: "mirror-mind" }],
       });
       res.json({ success: true, notionPageId: page?.id });
