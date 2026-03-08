@@ -8,8 +8,16 @@ import {
   updateFeasibilitySignal,
   closeSession,
   getUserSessions,
+  getAllUserSessions,
 } from "../services/firebaseService";
 import { syncSessionToNotion } from "../services/notionService";
+import {
+  getKnowledgeGraph,
+  getKnowledgeGraphNode,
+  rebuildKnowledgeGraphFromSessionMaps,
+  searchKnowledgeGraph,
+  upsertKnowledgeGraphFromConceptMap,
+} from "../services/knowledgeGraphService";
 
 const router = Router();
 
@@ -161,6 +169,11 @@ router.post(
         const { conceptMap, feasibilitySignal } = parseStructuredResponse(fullResponse);
         if (hasConceptMapData(conceptMap)) {
           await updateConceptMap(sid, conceptMap);
+          await upsertKnowledgeGraphFromConceptMap({
+            userId,
+            sessionId: sid,
+            conceptMap,
+          });
         }
         if (feasibilitySignal != null) {
           await updateFeasibilitySignal(sid, feasibilitySignal);
@@ -241,6 +254,87 @@ router.get("/concept-maps", async (req: Request & { userId?: string }, res: Resp
   } catch (error) {
     console.error("Get concept maps error:", error);
     res.status(500).json({ error: "Failed to fetch concept maps" });
+  }
+});
+
+router.get("/knowledge-graph", async (req: Request & { userId?: string }, res: Response): Promise<void> => {
+  try {
+    const userId = req.userId!;
+    const limitNodes = parseInt(req.query.limitNodes as string, 10) || 300;
+    const limitEdges = parseInt(req.query.limitEdges as string, 10) || 600;
+    const graph = await getKnowledgeGraph(userId, limitNodes, limitEdges);
+    res.json(graph);
+  } catch (error) {
+    console.error("Get knowledge graph error:", error);
+    res.status(500).json({ error: "Failed to fetch knowledge graph" });
+  }
+});
+
+router.get("/knowledge-graph/search", async (req: Request & { userId?: string }, res: Response): Promise<void> => {
+  try {
+    const userId = req.userId!;
+    const q = String(req.query.q ?? "").trim();
+    const limit = parseInt(req.query.limit as string, 10) || 20;
+    if (!q) {
+      res.status(400).json({ error: "q query param required" });
+      return;
+    }
+    const result = await searchKnowledgeGraph(userId, q, limit);
+    res.json(result);
+  } catch (error) {
+    console.error("Search knowledge graph error:", error);
+    res.status(500).json({ error: "Failed to search knowledge graph" });
+  }
+});
+
+router.get("/knowledge-graph/node/:nodeId", async (req: Request & { userId?: string }, res: Response): Promise<void> => {
+  try {
+    const userId = req.userId!;
+    const nodeId = Array.isArray(req.params.nodeId) ? req.params.nodeId[0] : req.params.nodeId;
+    if (!nodeId) {
+      res.status(400).json({ error: "nodeId required" });
+      return;
+    }
+    const details = await getKnowledgeGraphNode(userId, nodeId);
+    if (!details.node) {
+      res.status(404).json({ error: "Node not found" });
+      return;
+    }
+    res.json(details);
+  } catch (error) {
+    console.error("Get knowledge graph node error:", error);
+    res.status(500).json({ error: "Failed to fetch graph node" });
+  }
+});
+
+router.post("/knowledge-graph/rebuild", async (req: Request & { userId?: string }, res: Response): Promise<void> => {
+  try {
+    const userId = req.userId!;
+    const sessions = await getAllUserSessions(userId);
+    const sessionMaps = sessions.map((s) => {
+      let conceptMap = s.conceptMap ?? {};
+      if (!hasConceptMapData(conceptMap)) {
+        const latestAssistantReply = extractLatestAssistantReply(s.messages ?? []);
+        if (latestAssistantReply) {
+          conceptMap = parseStructuredResponse(latestAssistantReply).conceptMap;
+        }
+      }
+      return { sessionId: s.id, conceptMap };
+    });
+    const stats = await rebuildKnowledgeGraphFromSessionMaps({
+      userId,
+      sessions: sessionMaps,
+    });
+    res.json({
+      success: true,
+      sessionsTotal: sessions.length,
+      sessionsUsed: stats.sessionsProcessed,
+      nodes: stats.nodes,
+      edges: stats.edges,
+    });
+  } catch (error) {
+    console.error("Rebuild knowledge graph error:", error);
+    res.status(500).json({ error: "Failed to rebuild knowledge graph" });
   }
 });
 
