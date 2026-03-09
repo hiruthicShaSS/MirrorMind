@@ -4,32 +4,35 @@ import {
   verifyGoogleCredential,
   getOrCreateUser,
   createSessionToken,
+  encodeUserId,
 } from "../services/authService";
 import { verifyAuth } from "../middleware/authMiddleware";
 
 const router = Router();
 
 function setSessionCookie(res: Response, sessionToken: string): void {
+  const crossSiteCookies = process.env.CROSS_SITE_COOKIES === "1";
   const isSecure = process.env.NODE_ENV === "production";
+  const sameSite: "lax" | "strict" | "none" = crossSiteCookies ? "none" : "lax";
   res.cookie("__Secure-auth-session", sessionToken, {
     httpOnly: true,
-    secure: isSecure,
-    sameSite: "lax",
+    secure: isSecure || crossSiteCookies,
+    sameSite,
     maxAge: 7 * 24 * 60 * 60 * 1000,
     path: "/",
   });
-  if (!isSecure) {
+  if (!isSecure && !crossSiteCookies) {
     res.cookie("auth-session", sessionToken, {
       httpOnly: true,
       secure: false,
-      sameSite: "lax",
+      sameSite,
       maxAge: 7 * 24 * 60 * 60 * 1000,
       path: "/",
     });
   }
 }
 
-router.post("/login", async (req: Request, res: Response): Promise<void> => {
+async function handleGoogleLogin(req: Request, res: Response): Promise<void> {
   try {
     const { credential, idToken } = req.body as { credential?: string; idToken?: string };
     const token = credential ?? idToken;
@@ -42,7 +45,13 @@ router.post("/login", async (req: Request, res: Response): Promise<void> => {
     const user = await getOrCreateUser(userInfo, db as unknown as Parameters<typeof getOrCreateUser>[1]);
     const sessionToken = createSessionToken(user.id);
     setSessionCookie(res, sessionToken);
-    res.json({ id: user.id, email: user.email, name: user.name, picture: user.picture });
+    res.json({
+      id: user.id,
+      encodedUserId: encodeUserId(user.id),
+      email: user.email,
+      name: user.name,
+      picture: user.picture,
+    });
   } catch (error) {
     console.error("Login error:", error);
     res.status(401).json({
@@ -50,7 +59,10 @@ router.post("/login", async (req: Request, res: Response): Promise<void> => {
       message: error instanceof Error ? error.message : "Unknown error",
     });
   }
-});
+}
+
+router.post("/login", handleGoogleLogin);
+router.post("/google", handleGoogleLogin);
 
 router.get("/me", verifyAuth, async (req: Request & { userId?: string }, res: Response): Promise<void> => {
   try {
@@ -63,7 +75,13 @@ router.get("/me", verifyAuth, async (req: Request & { userId?: string }, res: Re
       res.status(404).json({ error: "User not found" });
       return;
     }
-    res.json({ id: user.id, email: user.email, name: user.name, picture: user.picture });
+    res.json({
+      id: user.id,
+      encodedUserId: encodeUserId(user.id),
+      email: user.email,
+      name: user.name,
+      picture: user.picture,
+    });
   } catch (error) {
     console.error("Get user error:", error);
     res.status(500).json({ error: error instanceof Error ? error.message : "Unknown error" });
