@@ -30,6 +30,13 @@ interface InMemoryDb {
   collection(name: string): InMemoryCollectionRef;
 }
 
+interface ServiceAccountEnvShape {
+  project_id?: string;
+  private_key?: string;
+  client_email?: string;
+  private_key_id?: string;
+}
+
 function createInMemoryDb(): InMemoryDb {
   return {
     collection(collectionName: string) {
@@ -113,10 +120,61 @@ export interface FormattedSession {
 export async function initFirebase(): Promise<FirestoreLike> {
   if (initialized && db) return db;
 
-  const keyPath = path.join(process.cwd(), "firebase-key.json");
-  const keyFileExists = fs.existsSync(keyPath);
+  const rawCredPath = (process.env.GOOGLE_APPLICATION_CREDENTIALS ?? "").trim();
+  const resolvedCredPath = rawCredPath
+    ? path.isAbsolute(rawCredPath)
+      ? rawCredPath
+      : path.resolve(process.cwd(), rawCredPath)
+    : "";
+  const hasValidCredFile = resolvedCredPath ? fs.existsSync(resolvedCredPath) : false;
+  if (rawCredPath && !hasValidCredFile) {
+    console.warn(`GOOGLE_APPLICATION_CREDENTIALS points to missing file: ${resolvedCredPath}. Ignoring.`);
+    delete process.env.GOOGLE_APPLICATION_CREDENTIALS;
+  }
 
-  if (!keyFileExists && process.env.NODE_ENV === "development") {
+  const parseServiceAccountFromEnv = (): ServiceAccountEnvShape | null => {
+    const rawKey = (process.env.FIREBASE_SERVICE_ACCOUNT_KEY ?? "").trim();
+    if (rawKey) {
+      try {
+        if (rawKey.startsWith("{")) {
+          return JSON.parse(rawKey) as ServiceAccountEnvShape;
+        }
+        const json = Buffer.from(rawKey, "base64").toString("utf8");
+        return JSON.parse(json) as ServiceAccountEnvShape;
+      } catch {
+        console.warn("FIREBASE_SERVICE_ACCOUNT_KEY is invalid (expected JSON or base64 JSON). Ignoring.");
+      }
+    }
+
+    const rawJson = (process.env.FIREBASE_SERVICE_ACCOUNT_JSON ?? "").trim();
+    if (rawJson) {
+      try {
+        return JSON.parse(rawJson) as ServiceAccountEnvShape;
+      } catch {
+        console.warn("FIREBASE_SERVICE_ACCOUNT_JSON is not valid JSON. Ignoring.");
+      }
+    }
+
+    const rawB64 = (process.env.FIREBASE_SERVICE_ACCOUNT_JSON_B64 ?? "").trim();
+    if (rawB64) {
+      try {
+        const json = Buffer.from(rawB64, "base64").toString("utf8");
+        return JSON.parse(json) as ServiceAccountEnvShape;
+      } catch {
+        console.warn("FIREBASE_SERVICE_ACCOUNT_JSON_B64 is invalid. Ignoring.");
+      }
+    }
+    return null;
+  };
+
+  const serviceAccountJson = parseServiceAccountFromEnv();
+  const hasServiceAccountEnv =
+    (!!process.env.FIREBASE_PROJECT_ID && !!process.env.FIREBASE_PRIVATE_KEY) ||
+    (!!serviceAccountJson?.project_id && !!serviceAccountJson?.private_key && !!serviceAccountJson?.client_email);
+  const hasProjectIdOnly = !!process.env.FIREBASE_PROJECT_ID;
+  const noUsableFirebaseCreds = !hasValidCredFile && !hasServiceAccountEnv && !hasProjectIdOnly;
+
+  if (noUsableFirebaseCreds && process.env.NODE_ENV === "development") {
     console.warn("\n⚠️  firebase-key.json not found!");
     console.warn("✓ Running in DEVELOPMENT MODE with in-memory storage\n");
     usingFallback = true;
@@ -126,19 +184,25 @@ export async function initFirebase(): Promise<FirestoreLike> {
   }
 
   try {
-    if (process.env.GOOGLE_APPLICATION_CREDENTIALS && keyFileExists) {
+    if (process.env.GOOGLE_APPLICATION_CREDENTIALS && hasValidCredFile) {
       admin.initializeApp();
-    } else if (process.env.FIREBASE_PROJECT_ID && process.env.FIREBASE_PRIVATE_KEY) {
+    } else if (hasServiceAccountEnv) {
+      const projectId = serviceAccountJson?.project_id ?? process.env.FIREBASE_PROJECT_ID;
+      const privateKeyRaw = serviceAccountJson?.private_key ?? process.env.FIREBASE_PRIVATE_KEY ?? "";
+      const clientEmail = serviceAccountJson?.client_email ?? process.env.FIREBASE_CLIENT_EMAIL;
       admin.initializeApp({
         credential: admin.credential.cert({
-          projectId: process.env.FIREBASE_PROJECT_ID,
-          privateKey: (process.env.FIREBASE_PRIVATE_KEY ?? "").replace(/\\n/g, "\n"),
-          clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+          projectId,
+          privateKey: privateKeyRaw.replace(/\\n/g, "\n"),
+          clientEmail,
           authUri: "https://accounts.google.com/o/oauth2/auth",
           tokenUri: "https://oauth2.googleapis.com/token",
           authProviderX509CertUrl: "https://www.googleapis.com/oauth2/v1/certs",
         } as admin.ServiceAccount),
       });
+    } else if (hasProjectIdOnly) {
+      // Uses ADC (gcloud auth / runtime service account) without embedding private key in .env.
+      admin.initializeApp({ projectId: process.env.FIREBASE_PROJECT_ID });
     } else {
       throw new Error("No valid Firebase credentials provided");
     }
@@ -271,13 +335,27 @@ export async function getUserSessions(userId: string, limit = 10): Promise<Forma
     sessions.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
     return sessions.slice(0, limit);
   }
-  const snapshot = await (database as admin.firestore.Firestore)
-    .collection("sessions")
-    .where("userId", "==", userId)
-    .orderBy("createdAt", "desc")
-    .limit(limit)
-    .get();
-  return snapshot.docs.map((doc) => formatSessionResponse(doc.data() as unknown as SessionData));
+  try {
+    const snapshot = await (database as admin.firestore.Firestore)
+      .collection("sessions")
+      .where("userId", "==", userId)
+      .orderBy("createdAt", "desc")
+      .limit(limit)
+      .get();
+    return snapshot.docs.map((doc) => formatSessionResponse(doc.data() as unknown as SessionData));
+  } catch (error) {
+    // Fallback path for missing index or query constraints: scan recent sessions and filter in memory.
+    console.warn("getUserSessions query fallback:", error instanceof Error ? error.message : String(error));
+    const snapshot = await (database as admin.firestore.Firestore)
+      .collection("sessions")
+      .orderBy("createdAt", "desc")
+      .limit(Math.max(limit * 5, 100))
+      .get();
+    return snapshot.docs
+      .map((doc) => formatSessionResponse(doc.data() as unknown as SessionData))
+      .filter((s) => s.userId === userId)
+      .slice(0, limit);
+  }
 }
 
 export async function getAllUserSessions(userId: string, batchSize = 200): Promise<FormattedSession[]> {
@@ -297,20 +375,43 @@ export async function getAllUserSessions(userId: string, batchSize = 200): Promi
   const out: FormattedSession[] = [];
   let cursor: admin.firestore.QueryDocumentSnapshot | null = null;
 
-  while (true) {
-    let query = (database as admin.firestore.Firestore)
-      .collection("sessions")
-      .where("userId", "==", userId)
-      .orderBy("createdAt", "asc")
-      .limit(batchSize);
+  try {
+    while (true) {
+      let query = (database as admin.firestore.Firestore)
+        .collection("sessions")
+        .where("userId", "==", userId)
+        .orderBy("createdAt", "asc")
+        .limit(batchSize);
 
-    if (cursor) query = query.startAfter(cursor);
+      if (cursor) query = query.startAfter(cursor);
 
-    const snapshot = await query.get();
-    if (snapshot.empty) break;
-    out.push(...snapshot.docs.map((doc) => formatSessionResponse(doc.data() as unknown as SessionData)));
-    cursor = snapshot.docs[snapshot.docs.length - 1] ?? null;
-    if (snapshot.size < batchSize) break;
+      const snapshot = await query.get();
+      if (snapshot.empty) break;
+      out.push(...snapshot.docs.map((doc) => formatSessionResponse(doc.data() as unknown as SessionData)));
+      cursor = snapshot.docs[snapshot.docs.length - 1] ?? null;
+      if (snapshot.size < batchSize) break;
+    }
+  } catch (error) {
+    // Fallback path for missing composite index: fetch batches ordered by createdAt and filter user in memory.
+    console.warn("getAllUserSessions query fallback:", error instanceof Error ? error.message : String(error));
+    out.length = 0;
+    cursor = null;
+    while (true) {
+      let query = (database as admin.firestore.Firestore)
+        .collection("sessions")
+        .orderBy("createdAt", "asc")
+        .limit(batchSize);
+      if (cursor) query = query.startAfter(cursor);
+      const snapshot = await query.get();
+      if (snapshot.empty) break;
+      out.push(
+        ...snapshot.docs
+          .map((doc) => formatSessionResponse(doc.data() as unknown as SessionData))
+          .filter((s) => s.userId === userId)
+      );
+      cursor = snapshot.docs[snapshot.docs.length - 1] ?? null;
+      if (snapshot.size < batchSize) break;
+    }
   }
 
   return out;

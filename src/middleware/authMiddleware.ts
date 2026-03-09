@@ -9,6 +9,24 @@ export async function verifyAuth(
   res: Response,
   next: NextFunction
 ): Promise<void> {
+  // Keep knowledge graph available even when no auth session is active.
+  if (req.path.startsWith("/knowledge-graph")) {
+    const sessionToken =
+      (req.cookies as { ["__Secure-auth-session"]?: string })["__Secure-auth-session"] ??
+      (req.cookies as { ["auth-session"]?: string })["auth-session"];
+    if (!sessionToken) {
+      req.userId = "anonymous";
+      return next();
+    }
+    try {
+      req.userId = verifySessionToken(sessionToken).userId;
+      return next();
+    } catch {
+      req.userId = "anonymous";
+      return next();
+    }
+  }
+
   const sessionToken =
     (req.cookies as { ["__Secure-auth-session"]?: string })["__Secure-auth-session"] ??
     (req.cookies as { ["auth-session"]?: string })["auth-session"];

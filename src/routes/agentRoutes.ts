@@ -18,6 +18,7 @@ import {
   searchKnowledgeGraph,
   upsertKnowledgeGraphFromConceptMap,
 } from "../services/knowledgeGraphService";
+import { decodeUserId } from "../services/authService";
 
 const router = Router();
 
@@ -87,6 +88,39 @@ function latestIdeaConversation(messages: { role: string; content?: string }[] =
   const out: { role: "user" | "assistant"; content: string }[] = [{ role: "user", content: userMsg }];
   if (assistantMsg) out.push({ role: "assistant", content: assistantMsg });
   return out;
+}
+
+function sessionConceptMapsForRebuild(
+  sessions: { id: string; conceptMap: Record<string, string[]>; messages: { role: string; content?: string }[] }[]
+): { sessionId: string; conceptMap: Record<string, string[]> }[] {
+  return sessions.map((s) => {
+    let conceptMap = s.conceptMap ?? {};
+    if (!hasConceptMapData(conceptMap)) {
+      const latestAssistantReply = extractLatestAssistantReply(s.messages ?? []);
+      if (latestAssistantReply) {
+        conceptMap = parseStructuredResponse(latestAssistantReply).conceptMap;
+      }
+    }
+    return { sessionId: s.id, conceptMap };
+  });
+}
+
+function resolveGraphUserId(req: Request & { userId?: string }): string {
+  const authUserId = (req.userId ?? "").trim();
+  if (authUserId && authUserId !== "anonymous") return authUserId;
+
+  const encodedRaw = Array.isArray(req.query.encodedUserId)
+    ? req.query.encodedUserId[0]
+    : req.query.encodedUserId;
+  const encodedUserId = String(encodedRaw ?? "").trim();
+  if (encodedUserId) {
+    const decoded = decodeUserId(encodedUserId);
+    if (decoded) return decoded;
+  }
+
+  const userIdRaw = Array.isArray(req.query.userId) ? req.query.userId[0] : req.query.userId;
+  const queryUserId = String(userIdRaw ?? "").trim();
+  return queryUserId || "anonymous";
 }
 
 router.post("/sessions", async (req: Request & { userId?: string }, res: Response): Promise<void> => {
@@ -259,11 +293,30 @@ router.get("/concept-maps", async (req: Request & { userId?: string }, res: Resp
 
 router.get("/knowledge-graph", async (req: Request & { userId?: string }, res: Response): Promise<void> => {
   try {
-    const userId = req.userId!;
+    const userId = resolveGraphUserId(req);
     const limitNodes = parseInt(req.query.limitNodes as string, 10) || 300;
     const limitEdges = parseInt(req.query.limitEdges as string, 10) || 600;
-    const graph = await getKnowledgeGraph(userId, limitNodes, limitEdges);
-    res.json(graph);
+    let graph = await getKnowledgeGraph(userId, limitNodes, limitEdges);
+
+    // If graph store is empty, auto-rebuild from all sessions to avoid blank UI.
+    if ((graph.nodes?.length ?? 0) === 0) {
+      const sessions = await getAllUserSessions(userId);
+      const stats = await rebuildKnowledgeGraphFromSessionMaps({
+        userId,
+        sessions: sessionConceptMapsForRebuild(sessions),
+      });
+      graph = await getKnowledgeGraph(userId, limitNodes, limitEdges);
+      res.json({
+        ...graph,
+        resolvedUserId: userId,
+        rebuilt: true,
+        sessionsTotal: sessions.length,
+        sessionsUsed: stats.sessionsProcessed,
+      });
+      return;
+    }
+
+    res.json({ ...graph, resolvedUserId: userId, rebuilt: false });
   } catch (error) {
     console.error("Get knowledge graph error:", error);
     res.status(500).json({ error: "Failed to fetch knowledge graph" });
@@ -272,7 +325,7 @@ router.get("/knowledge-graph", async (req: Request & { userId?: string }, res: R
 
 router.get("/knowledge-graph/search", async (req: Request & { userId?: string }, res: Response): Promise<void> => {
   try {
-    const userId = req.userId!;
+    const userId = resolveGraphUserId(req);
     const q = String(req.query.q ?? "").trim();
     const limit = parseInt(req.query.limit as string, 10) || 20;
     if (!q) {
@@ -289,7 +342,7 @@ router.get("/knowledge-graph/search", async (req: Request & { userId?: string },
 
 router.get("/knowledge-graph/node/:nodeId", async (req: Request & { userId?: string }, res: Response): Promise<void> => {
   try {
-    const userId = req.userId!;
+    const userId = resolveGraphUserId(req);
     const nodeId = Array.isArray(req.params.nodeId) ? req.params.nodeId[0] : req.params.nodeId;
     if (!nodeId) {
       res.status(400).json({ error: "nodeId required" });
@@ -309,24 +362,15 @@ router.get("/knowledge-graph/node/:nodeId", async (req: Request & { userId?: str
 
 router.post("/knowledge-graph/rebuild", async (req: Request & { userId?: string }, res: Response): Promise<void> => {
   try {
-    const userId = req.userId!;
+    const userId = resolveGraphUserId(req);
     const sessions = await getAllUserSessions(userId);
-    const sessionMaps = sessions.map((s) => {
-      let conceptMap = s.conceptMap ?? {};
-      if (!hasConceptMapData(conceptMap)) {
-        const latestAssistantReply = extractLatestAssistantReply(s.messages ?? []);
-        if (latestAssistantReply) {
-          conceptMap = parseStructuredResponse(latestAssistantReply).conceptMap;
-        }
-      }
-      return { sessionId: s.id, conceptMap };
-    });
     const stats = await rebuildKnowledgeGraphFromSessionMaps({
       userId,
-      sessions: sessionMaps,
+      sessions: sessionConceptMapsForRebuild(sessions),
     });
     res.json({
       success: true,
+      resolvedUserId: userId,
       sessionsTotal: sessions.length,
       sessionsUsed: stats.sessionsProcessed,
       nodes: stats.nodes,

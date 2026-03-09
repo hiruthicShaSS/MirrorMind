@@ -37,6 +37,36 @@ function normalizeLabel(label: string): string {
   return label.trim().replace(/\s+/g, " ");
 }
 
+const GRAPH_LABEL_MAX = 64;
+const BLOCKED_LABEL_RE = /\b(thoughts?|analysis|reasoning|conversation|response|assistant|user|mirror\s*mind)\b/i;
+
+function isValidGraphLabel(labelRaw: string, kind: "concept" | "term"): boolean {
+  const label = normalizeLabel(labelRaw);
+  if (!label) return false;
+  if (label.length > GRAPH_LABEL_MAX) return false;
+  if (BLOCKED_LABEL_RE.test(label)) return false;
+  // Drop sentence-like content; graph labels should be short noun phrases.
+  if (/[.!?]/.test(label)) return false;
+  if (kind === "concept" && label.split(" ").length > 6) return false;
+  if (kind === "term" && label.split(" ").length > 5) return false;
+  return true;
+}
+
+function sanitizeConceptMapForGraph(conceptMap: Record<string, string[]>): Record<string, string[]> {
+  const out: Record<string, string[]> = {};
+  for (const [conceptRaw, termsRaw] of Object.entries(conceptMap ?? {})) {
+    const concept = normalizeLabel(String(conceptRaw || ""));
+    if (!isValidGraphLabel(concept, "concept")) continue;
+    const terms = (Array.isArray(termsRaw) ? termsRaw : [])
+      .map((t) => normalizeLabel(String(t || "")))
+      .filter((t) => isValidGraphLabel(t, "term"));
+    const deduped = [...new Set(terms)];
+    if (deduped.length === 0) continue;
+    out[concept] = deduped.slice(0, 12);
+  }
+  return out;
+}
+
 function toNodeId(label: string): string {
   const normalized = normalizeLabel(label).toLowerCase();
   const slug = normalized
@@ -167,7 +197,7 @@ export async function upsertKnowledgeGraphFromConceptMap(input: {
 }): Promise<void> {
   const userId = (input.userId ?? "").trim();
   if (!userId) return;
-  const conceptMap = input.conceptMap ?? {};
+  const conceptMap = sanitizeConceptMapForGraph(input.conceptMap ?? {});
   if (Object.keys(conceptMap).length === 0) return;
 
   const at = nowIso();
@@ -278,7 +308,7 @@ export async function rebuildKnowledgeGraphFromSessionMaps(input: {
 
   let sessionsProcessed = 0;
   for (const s of input.sessions) {
-    const conceptMap = s.conceptMap ?? {};
+    const conceptMap = sanitizeConceptMapForGraph(s.conceptMap ?? {});
     if (Object.keys(conceptMap).length === 0) continue;
     sessionsProcessed++;
     const at = nowIso();
