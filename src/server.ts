@@ -15,7 +15,15 @@ import { attachLiveWs } from "./liveWsHandler";
 
 const app = express();
 
-const envOrigins = (process.env.FRONTEND_URL ?? "http://localhost:5173")
+const defaultProdOrigins = [
+  "https://mirror-mind.hiruthicsha.com",
+  "https://mirrormind-production.up.railway.app",
+];
+
+const envOrigins = (process.env.FRONTEND_URL ??
+  (process.env.NODE_ENV === "production"
+    ? defaultProdOrigins.join(",")
+    : "http://localhost:5173"))
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);
