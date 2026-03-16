@@ -102,6 +102,8 @@ export interface SessionData {
   messages: { id?: string; role?: string; content?: string; createdAt?: string; timestamp?: { toDate?: () => Date } }[];
   conceptMap: Record<string, string[]> | { nodes?: unknown[]; edges?: unknown[] };
   feasibilitySignal: number | null;
+  pocDraft?: Record<string, unknown> | null;
+  pocNotification?: Record<string, unknown> | null;
   isActive: boolean;
 }
 
@@ -114,7 +116,30 @@ export interface FormattedSession {
   messages: { id: string; role: string; content: string; createdAt: string }[];
   conceptMap: Record<string, string[]>;
   feasibilitySignal: number | null;
+  pocDraft?: Record<string, unknown> | null;
+  pocNotification?: Record<string, unknown> | null;
   isActive: boolean;
+}
+
+export interface StoredGithubConnection {
+  connected: boolean;
+  accessToken: string;
+  login: string | null;
+  name?: string | null;
+  avatarUrl?: string | null;
+  scopes?: string[];
+  defaultOwner?: string | null;
+  defaultRepo?: string | null;
+  connectedAt: string;
+  updatedAt: string;
+}
+
+export interface UserProfileRecord {
+  id: string;
+  email: string;
+  name: string;
+  picture: string | null;
+  github?: StoredGithubConnection | null;
 }
 
 export async function initFirebase(): Promise<FirestoreLike> {
@@ -312,6 +337,21 @@ export async function updateFeasibilitySignal(
   return { ...session, feasibilitySignal: signal };
 }
 
+export async function updateSessionPocDraft(
+  sessionId: string,
+  pocDraft: Record<string, unknown>,
+  pocNotification: Record<string, unknown> | null = null
+): Promise<FormattedSession> {
+  const session = await getSession(sessionId);
+  if (!session) throw new Error("Session not found");
+  await (await initFirebase()).collection("sessions").doc(sessionId).update({
+    pocDraft,
+    pocNotification,
+    updatedAt: nowStamp(),
+  } as unknown as Record<string, unknown>);
+  return { ...session, pocDraft, pocNotification };
+}
+
 export async function closeSession(sessionId: string): Promise<FormattedSession> {
   const session = await getSession(sessionId);
   if (!session) throw new Error("Session not found");
@@ -415,4 +455,26 @@ export async function getAllUserSessions(userId: string, batchSize = 200): Promi
   }
 
   return out;
+}
+
+export async function getUserProfile(userId: string): Promise<UserProfileRecord | null> {
+  const database = await initFirebase();
+  const doc = await (database as InMemoryDb).collection("users").doc(userId).get();
+  if (!doc.exists) return null;
+  const data = doc.data() as UserProfileRecord | undefined;
+  return data ?? null;
+}
+
+export async function updateUserProfile(
+  userId: string,
+  updates: Partial<UserProfileRecord>
+): Promise<UserProfileRecord> {
+  const database = await initFirebase();
+  const existing = await getUserProfile(userId);
+  if (!existing) throw new Error("User not found");
+  const next = { ...existing, ...updates } as UserProfileRecord;
+  await (database as InMemoryDb).collection("users").doc(userId).update(
+    next as unknown as Record<string, unknown>
+  );
+  return next;
 }

@@ -9,6 +9,7 @@ import {
   closeSession,
   getUserSessions,
   getAllUserSessions,
+  updateSessionPocDraft,
 } from "../services/firebaseService";
 import { syncSessionToNotion } from "../services/notionService";
 import {
@@ -19,6 +20,16 @@ import {
   upsertKnowledgeGraphFromConceptMap,
 } from "../services/knowledgeGraphService";
 import { decodeUserId } from "../services/authService";
+import { buildPocDraft } from "../services/pocService";
+import { notifyPocReady } from "../services/notificationService";
+import {
+  publishPocAsPullRequest,
+  publishPocToGitHub,
+} from "../services/githubPublishingService";
+import {
+  getGitHubConnection,
+  setGitHubDefaultRepo,
+} from "../services/githubAccountService";
 
 const router = Router();
 
@@ -121,6 +132,99 @@ function resolveGraphUserId(req: Request & { userId?: string }): string {
   const userIdRaw = Array.isArray(req.query.userId) ? req.query.userId[0] : req.query.userId;
   const queryUserId = String(userIdRaw ?? "").trim();
   return queryUserId || "anonymous";
+}
+
+function parseTechStack(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((v) => String(v ?? "").trim())
+    .filter(Boolean)
+    .slice(0, 8);
+}
+
+function parseStringList(value: unknown, limit = 8): string[] {
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => String(item ?? "").trim())
+      .filter(Boolean)
+      .slice(0, limit);
+  }
+
+  const text = String(value ?? "").trim();
+  if (!text) return [];
+  return text
+    .split(/\r?\n|,/)
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .slice(0, limit);
+}
+
+function deriveReferenceLinks(seedText: string, explicitLinks: string[]): string[] {
+  if (explicitLinks.length > 0) return explicitLinks;
+
+  const text = seedText.toLowerCase();
+  const matches: string[] = [];
+
+  const catalog: Array<{ keywords: string[]; links: string[] }> = [
+    {
+      keywords: ["athlete", "fitness", "training", "workout", "breathing", "health"],
+      links: ["https://www.strava.com/", "https://www.whoop.com/", "https://www.headspace.com/"],
+    },
+    {
+      keywords: ["meditation", "mindfulness", "sleep", "wellness"],
+      links: ["https://www.calm.com/", "https://www.headspace.com/"],
+    },
+    {
+      keywords: ["task", "project", "productivity", "team", "collaboration"],
+      links: ["https://www.notion.so/", "https://trello.com/", "https://asana.com/"],
+    },
+    {
+      keywords: ["chat", "community", "social", "messaging"],
+      links: ["https://discord.com/", "https://slack.com/", "https://www.reddit.com/"],
+    },
+    {
+      keywords: ["finance", "budget", "banking", "expense", "invest"],
+      links: ["https://www.mint.com/", "https://www.ynab.com/", "https://www.robinhood.com/"],
+    },
+    {
+      keywords: ["education", "learning", "course", "student"],
+      links: ["https://www.khanacademy.org/", "https://www.duolingo.com/", "https://www.coursera.org/"],
+    },
+    {
+      keywords: ["ecommerce", "shop", "store", "marketplace"],
+      links: ["https://www.shopify.com/", "https://www.etsy.com/", "https://www.amazon.com/"],
+    },
+    {
+      keywords: ["travel", "trip", "hotel", "booking"],
+      links: ["https://www.airbnb.com/", "https://www.booking.com/", "https://www.tripadvisor.com/"],
+    },
+  ];
+
+  for (const group of catalog) {
+    if (group.keywords.some((keyword) => text.includes(keyword))) {
+      for (const link of group.links) {
+        if (!matches.includes(link)) matches.push(link);
+      }
+    }
+    if (matches.length >= 3) break;
+  }
+
+  return matches.slice(0, 3);
+}
+
+function resolveAiStudioLink(value: unknown): string {
+  const explicit = String(value ?? "").trim();
+  if (explicit) return explicit;
+  return String(process.env.AI_STUDIO_DEFAULT_LINK ?? "https://aistudio.google.com/apps").trim();
+}
+
+function normalizeRepoTarget(value: unknown): { owner: string; repo: string } | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const rec = value as Record<string, unknown>;
+  const owner = String(rec.owner ?? "").trim();
+  const repo = String(rec.repo ?? "").trim();
+  if (!owner || !repo) return null;
+  return { owner, repo };
 }
 
 router.post("/sessions", async (req: Request & { userId?: string }, res: Response): Promise<void> => {
@@ -409,6 +513,720 @@ router.put(
     } catch (error) {
       console.error("Update concept map error:", error);
       res.status(500).json({ error: "Failed to update concept map" });
+    }
+  }
+);
+
+router.post(
+  "/sessions/:sessionId/poc",
+  async (req: Request & { userId?: string }, res: Response): Promise<void> => {
+    try {
+      const userId = req.userId!;
+      const sessionId = sessionIdParam(req);
+      const session = await getSession(sessionId);
+      if (!session) {
+        res.status(404).json({ error: "Session not found" });
+        return;
+      }
+      if (session.userId && session.userId !== userId) {
+        res.status(403).json({ error: "Unauthorized" });
+        return;
+      }
+
+      const {
+        idea,
+        techStack,
+        productType,
+        targetUsers,
+        targetAudience,
+        futureChanges,
+        referenceLinks,
+        notificationEmail,
+        aiStudioLink,
+        aiStudioApiKey,
+        repo,
+        owner,
+        repoName,
+      } = req.body as {
+        idea?: string;
+        techStack?: unknown;
+        productType?: string;
+        targetUsers?: string;
+        targetAudience?: string;
+        futureChanges?: unknown;
+        referenceLinks?: unknown;
+        notificationEmail?: string;
+        aiStudioLink?: string;
+        aiStudioApiKey?: string;
+        repo?: unknown;
+        owner?: string;
+        repoName?: string;
+      };
+
+      const normalizedIdea = String(idea ?? extractLatestUserIdea(session.messages ?? [])).trim();
+      const normalizedTechStack = parseTechStack(techStack);
+      const normalizedTargetUsers = String(targetAudience ?? targetUsers ?? "").trim();
+      const normalizedFutureChanges = parseStringList(futureChanges);
+      const normalizedReferenceLinks = parseStringList(referenceLinks);
+      const normalizedEmail = String(notificationEmail ?? "").trim();
+      const normalizedAiStudioLink = resolveAiStudioLink(aiStudioLink);
+      const normalizedAiStudioApiKey = String(aiStudioApiKey ?? "").trim();
+
+      if (!normalizedIdea) {
+        res.status(400).json({ error: "idea is required (or session must contain user message)" });
+        return;
+      }
+      if (!normalizedTechStack.length) {
+        res.status(400).json({ error: "techStack array is required" });
+        return;
+      }
+      if (!normalizedAiStudioApiKey && !String(process.env.GOOGLE_API_KEY ?? "").trim()) {
+        res.status(400).json({ error: "aiStudioApiKey is required when server GOOGLE_API_KEY is not configured" });
+        return;
+      }
+
+      const pocDraft = await buildPocDraft({
+        idea: normalizedIdea,
+        techStack: normalizedTechStack,
+        productType: String(productType ?? "").trim() || undefined,
+        targetUsers: normalizedTargetUsers || undefined,
+      }, {
+        userApiKey: normalizedAiStudioApiKey || undefined,
+      });
+      const title = String(pocDraft.title ?? "POC Build").trim() || "POC Build";
+      const resolvedReferenceLinks = deriveReferenceLinks(
+        `${title}\n${normalizedIdea}\n${String(pocDraft.summary ?? "")}`,
+        normalizedReferenceLinks
+      );
+      const storedPocDraft = {
+        ...pocDraft,
+        title,
+        aiStudioLink: normalizedAiStudioLink,
+      };
+
+      let githubResult:
+        | {
+            owner: string;
+            repo: string;
+            baseBranch: string;
+            branch: string;
+            prUrl: string;
+            prNumber: number;
+            prTitle: string;
+            committedFiles: number;
+          }
+        | null = null;
+      let githubWarning: string | null = null;
+
+      const github = await getGitHubConnection(userId);
+      const repoOverride =
+        normalizeRepoTarget(repo) ??
+        (() => {
+          const maybeOwner = String(owner ?? "").trim();
+          const maybeRepo = String(repoName ?? "").trim();
+          return maybeOwner && maybeRepo ? { owner: maybeOwner, repo: maybeRepo } : null;
+        })();
+      const targetOwner = repoOverride?.owner ?? github?.defaultOwner ?? github?.login ?? "";
+      const targetRepo = repoOverride?.repo ?? github?.defaultRepo ?? "";
+
+      if (github?.accessToken && targetOwner && targetRepo) {
+        githubResult = await publishPocAsPullRequest({
+          token: github.accessToken,
+          owner: targetOwner,
+          repo: targetRepo,
+          prTitle: `POC: ${title}`,
+          prBody: [
+            String(pocDraft.summary ?? "").trim(),
+            "",
+            normalizedTargetUsers ? `Target audience: ${normalizedTargetUsers}` : "",
+            normalizedTechStack.length ? `Tech stack: ${normalizedTechStack.join(", ")}` : "",
+            normalizedFutureChanges.length
+              ? `Future changes required:\n- ${normalizedFutureChanges.join("\n- ")}`
+              : "",
+            resolvedReferenceLinks.length
+              ? `Reference apps:\n- ${resolvedReferenceLinks.join("\n- ")}`
+              : "",
+          ]
+            .filter(Boolean)
+            .join("\n"),
+          poc: {
+            title,
+            summary: String(pocDraft.summary ?? ""),
+            backendPlan: Array.isArray(pocDraft.backendPlan) ? pocDraft.backendPlan : [],
+            frontendPlan: Array.isArray(pocDraft.frontendPlan) ? pocDraft.frontendPlan : [],
+            nextSteps: Array.isArray(pocDraft.nextSteps) ? pocDraft.nextSteps : [],
+            files: Array.isArray(pocDraft.files) ? pocDraft.files : [],
+            idea: normalizedIdea,
+            techStack: normalizedTechStack,
+            aiStudioLink: normalizedAiStudioLink,
+          },
+        });
+
+        if (repoOverride) {
+          await setGitHubDefaultRepo(userId, repoOverride.owner, repoOverride.repo);
+        }
+      } else {
+        githubWarning =
+          "POC generated, but no GitHub PR was created because no connected GitHub repo target is configured.";
+      }
+
+      await appendMessage(
+        sessionId,
+        "assistant",
+        `POC generated for stack: ${normalizedTechStack.join(", ")}\n${pocDraft.summary}\nAI Studio: ${normalizedAiStudioLink}`
+      );
+
+      const notification = await notifyPocReady({
+        sessionId,
+        title,
+        aiStudioLink: normalizedAiStudioLink,
+        idea: normalizedIdea,
+        recipientEmail: normalizedEmail || undefined,
+        userId,
+        techStack: normalizedTechStack,
+        prUrl: githubResult?.prUrl,
+        futureChanges: normalizedFutureChanges,
+        referenceLinks: resolvedReferenceLinks,
+      });
+
+      if (process.env.NOTION_API_KEY && process.env.NOTION_DATABASE_ID) {
+        await syncSessionToNotion({
+          title: `Mirror Mind POC - ${title}`,
+          ideaDetails: normalizedIdea,
+          conceptMap: session.conceptMap ?? {},
+          feasibilitySignal: session.feasibilitySignal,
+          tags: [{ name: "mirror-mind" }, { name: "poc" }],
+          pocTitle: title,
+          pocSummary: String(pocDraft.summary ?? ""),
+          futureChanges: normalizedFutureChanges,
+          referenceLinks: resolvedReferenceLinks,
+          githubPrUrl: githubResult?.prUrl,
+        }).catch((e: Error) => console.warn("Notion POC sync skipped:", e.message));
+      }
+
+      await updateSessionPocDraft(
+        sessionId,
+        {
+          ...storedPocDraft,
+          github: githubResult
+            ? {
+                owner: githubResult.owner,
+                repo: githubResult.repo,
+                baseBranch: githubResult.baseBranch,
+                branch: githubResult.branch,
+                prUrl: githubResult.prUrl,
+                prNumber: githubResult.prNumber,
+                prTitle: githubResult.prTitle,
+                committedFiles: githubResult.committedFiles,
+                pushedAt: new Date().toISOString(),
+              }
+            : null,
+          idea: normalizedIdea,
+          techStack: normalizedTechStack,
+          productType: String(productType ?? "").trim() || null,
+          targetUsers: normalizedTargetUsers || null,
+          futureChanges: normalizedFutureChanges,
+          referenceLinks: resolvedReferenceLinks,
+          generatedAt: new Date().toISOString(),
+          generatedBy: "gemini-ai-studio-flow",
+          generatedWithUserKey: !!normalizedAiStudioApiKey,
+        },
+        {
+          ...notification,
+          email: normalizedEmail || null,
+          notifiedAt: new Date().toISOString(),
+        }
+      );
+
+      res.json({
+        success: true,
+        sessionId,
+        pocDraft: storedPocDraft,
+        github: githubResult,
+        githubWarning,
+        notification,
+      });
+    } catch (error) {
+      console.error("POC build error:", error);
+      res.status(500).json({
+        error: "Failed to build POC",
+        message: error instanceof Error ? error.message : "Unknown error",
+      });
+    }
+  }
+);
+
+router.post(
+  "/sessions/:sessionId/poc/confirm",
+  async (req: Request & { userId?: string }, res: Response): Promise<void> => {
+    try {
+      const userId = req.userId!;
+      const sessionId = sessionIdParam(req);
+      const session = await getSession(sessionId);
+      if (!session) {
+        res.status(404).json({ error: "Session not found" });
+        return;
+      }
+      if (session.userId && session.userId !== userId) {
+        res.status(403).json({ error: "Unauthorized" });
+        return;
+      }
+
+      const {
+        techStack,
+        targetAudience,
+        targetUsers,
+        productType,
+        futureChanges,
+        referenceLinks,
+        repo,
+        owner,
+        repoName,
+        notificationEmail,
+        aiStudioLink,
+        aiStudioApiKey,
+      } = req.body as {
+        techStack?: unknown;
+        targetAudience?: string;
+        targetUsers?: string;
+        productType?: string;
+        futureChanges?: unknown;
+        referenceLinks?: unknown;
+        repo?: unknown;
+        owner?: string;
+        repoName?: string;
+        notificationEmail?: string;
+        aiStudioLink?: string;
+        aiStudioApiKey?: string;
+      };
+
+      const github = await getGitHubConnection(userId);
+      if (!github) {
+        res.status(400).json({ error: "GitHub is not connected for this account" });
+        return;
+      }
+
+      const normalizedTechStack = parseTechStack(techStack);
+      const normalizedTargetUsers = String(targetAudience ?? targetUsers ?? "").trim();
+      const normalizedFutureChanges = parseStringList(futureChanges);
+      const normalizedReferenceLinks = parseStringList(referenceLinks);
+      const normalizedIdea = String(extractLatestUserIdea(session.messages ?? [])).trim();
+      const normalizedAiStudioApiKey = String(aiStudioApiKey ?? "").trim();
+      const normalizedEmail = String(notificationEmail ?? "").trim();
+      const normalizedAiStudioLink = resolveAiStudioLink(aiStudioLink);
+
+      if (!normalizedIdea) {
+        res.status(400).json({ error: "Session must contain a user idea before confirming POC" });
+        return;
+      }
+      if (!normalizedTechStack.length) {
+        res.status(400).json({ error: "techStack array is required" });
+        return;
+      }
+
+      const repoOverride =
+        normalizeRepoTarget(repo) ??
+        (() => {
+          const maybeOwner = String(owner ?? "").trim();
+          const maybeRepo = String(repoName ?? "").trim();
+          return maybeOwner && maybeRepo ? { owner: maybeOwner, repo: maybeRepo } : null;
+        })();
+
+      const targetOwner = repoOverride?.owner ?? github.defaultOwner ?? github.login ?? "";
+      const targetRepo = repoOverride?.repo ?? github.defaultRepo ?? "";
+      if (!targetOwner || !targetRepo) {
+        res.status(400).json({
+          error: "No target repository configured. Connect GitHub and set a default repo or pass owner/repo.",
+        });
+        return;
+      }
+
+      const pocDraft = await buildPocDraft(
+        {
+          idea: normalizedIdea,
+          techStack: normalizedTechStack,
+          productType: String(productType ?? "").trim() || undefined,
+          targetUsers: normalizedTargetUsers || undefined,
+        },
+        {
+          userApiKey: normalizedAiStudioApiKey || undefined,
+        }
+      );
+
+      const storedPocDraft = {
+        ...pocDraft,
+        idea: normalizedIdea,
+        techStack: normalizedTechStack,
+        productType: String(productType ?? "").trim() || null,
+        targetUsers: normalizedTargetUsers || null,
+        futureChanges: normalizedFutureChanges,
+        referenceLinks: deriveReferenceLinks(
+          `${String(pocDraft.title ?? "Mirror Mind POC")}\n${normalizedIdea}\n${String(pocDraft.summary ?? "")}`,
+          normalizedReferenceLinks
+        ),
+        aiStudioLink: normalizedAiStudioLink,
+        generatedAt: new Date().toISOString(),
+        generatedBy: "session-confirm-flow",
+        generatedWithUserKey: !!normalizedAiStudioApiKey,
+      };
+
+      const resolvedReferenceLinks = storedPocDraft.referenceLinks;
+
+      const prTitle = `POC: ${String(pocDraft.title ?? "Mirror Mind POC").trim() || "Mirror Mind POC"}`;
+      const prBody = [
+        String(pocDraft.summary ?? "").trim(),
+        "",
+        normalizedTargetUsers ? `Target audience: ${normalizedTargetUsers}` : "",
+        normalizedTechStack.length ? `Tech stack: ${normalizedTechStack.join(", ")}` : "",
+        normalizedFutureChanges.length
+          ? `Future changes required:\n- ${normalizedFutureChanges.join("\n- ")}`
+          : "",
+        resolvedReferenceLinks.length
+          ? `Reference apps:\n- ${resolvedReferenceLinks.join("\n- ")}`
+          : "",
+      ]
+        .filter(Boolean)
+        .join("\n");
+
+      const pr = await publishPocAsPullRequest({
+        token: github.accessToken,
+        owner: targetOwner,
+        repo: targetRepo,
+        prTitle,
+        prBody,
+        poc: {
+          title: String(pocDraft.title ?? "Mirror Mind POC").trim() || "Mirror Mind POC",
+          summary: String(pocDraft.summary ?? ""),
+          backendPlan: pocDraft.backendPlan,
+          frontendPlan: pocDraft.frontendPlan,
+          nextSteps: pocDraft.nextSteps,
+          files: pocDraft.files,
+          idea: normalizedIdea,
+          techStack: normalizedTechStack,
+          aiStudioLink: normalizedAiStudioLink,
+        },
+      });
+
+      const notification = await notifyPocReady({
+        sessionId,
+        title: pr.prTitle,
+        aiStudioLink: normalizedAiStudioLink,
+        idea: normalizedIdea,
+        recipientEmail: normalizedEmail || undefined,
+        userId,
+        techStack: normalizedTechStack,
+        prUrl: pr.prUrl,
+        futureChanges: normalizedFutureChanges,
+        referenceLinks: resolvedReferenceLinks,
+      });
+
+      if (process.env.NOTION_API_KEY && process.env.NOTION_DATABASE_ID) {
+        await syncSessionToNotion({
+          title: `Mirror Mind POC - ${pr.prTitle}`,
+          ideaDetails: normalizedIdea,
+          conceptMap: session.conceptMap ?? {},
+          feasibilitySignal: session.feasibilitySignal,
+          tags: [{ name: "mirror-mind" }, { name: "poc" }],
+          pocTitle: String(pocDraft.title ?? "Mirror Mind POC"),
+          pocSummary: String(pocDraft.summary ?? ""),
+          futureChanges: normalizedFutureChanges,
+          referenceLinks: resolvedReferenceLinks,
+          githubPrUrl: pr.prUrl,
+        }).catch((e: Error) => console.warn("Notion POC sync skipped:", e.message));
+      }
+
+      await updateSessionPocDraft(
+        sessionId,
+        {
+          ...storedPocDraft,
+          github: {
+            owner: pr.owner,
+            repo: pr.repo,
+            baseBranch: pr.baseBranch,
+            branch: pr.branch,
+            prUrl: pr.prUrl,
+            prNumber: pr.prNumber,
+            prTitle: pr.prTitle,
+            committedFiles: pr.committedFiles,
+            pushedAt: new Date().toISOString(),
+          },
+        },
+        {
+          ...notification,
+          email: normalizedEmail || null,
+          notifiedAt: new Date().toISOString(),
+        }
+      );
+
+      if (repoOverride) {
+        await setGitHubDefaultRepo(userId, repoOverride.owner, repoOverride.repo);
+      }
+
+      res.json({
+        success: true,
+        sessionId,
+        pocDraft: storedPocDraft,
+        github: pr,
+        notification,
+      });
+    } catch (error) {
+      console.error("POC confirm error:", error);
+      res.status(500).json({
+        error: "Failed to confirm POC",
+        message: error instanceof Error ? error.message : "Unknown error",
+      });
+    }
+  }
+);
+
+router.get(
+  "/sessions/:sessionId/poc",
+  async (req: Request & { userId?: string }, res: Response): Promise<void> => {
+    try {
+      const userId = req.userId!;
+      const session = await getSession(sessionIdParam(req));
+      if (!session) {
+        res.status(404).json({ error: "Session not found" });
+        return;
+      }
+      if (session.userId && session.userId !== userId) {
+        res.status(403).json({ error: "Unauthorized" });
+        return;
+      }
+      res.json({
+        sessionId: session.id,
+        pocDraft: session.pocDraft ?? null,
+        notification: session.pocNotification ?? null,
+      });
+    } catch (error) {
+      console.error("POC fetch error:", error);
+      res.status(500).json({ error: "Failed to fetch POC data" });
+    }
+  }
+);
+
+router.post(
+  "/sessions/:sessionId/poc/notify",
+  async (req: Request & { userId?: string }, res: Response): Promise<void> => {
+    try {
+      const userId = req.userId!;
+      const sessionId = sessionIdParam(req);
+      const session = await getSession(sessionId);
+      if (!session) {
+        res.status(404).json({ error: "Session not found" });
+        return;
+      }
+      if (session.userId && session.userId !== userId) {
+        res.status(403).json({ error: "Unauthorized" });
+        return;
+      }
+
+      const { notificationEmail, aiStudioLink, title } = req.body as {
+        notificationEmail?: string;
+        aiStudioLink?: string;
+        title?: string;
+      };
+      const email = String(notificationEmail ?? "").trim();
+      const pocDraft = (session.pocDraft ?? {}) as Record<string, unknown>;
+      const idea = String(pocDraft.idea ?? extractLatestUserIdea(session.messages ?? []) ?? "").trim();
+      const techStack = parseTechStack(pocDraft.techStack);
+      const resolvedTitle = String(title ?? pocDraft.title ?? "POC Build").trim() || "POC Build";
+      const resolvedAiStudioLink = resolveAiStudioLink(aiStudioLink ?? pocDraft.aiStudioLink);
+
+      if (!idea || !techStack.length) {
+        res.status(400).json({ error: "No generated POC found for this session" });
+        return;
+      }
+
+      const notification = await notifyPocReady({
+        sessionId,
+        title: resolvedTitle,
+        aiStudioLink: resolvedAiStudioLink,
+        userId,
+        recipientEmail: email || undefined,
+        idea,
+        techStack,
+      });
+
+      await updateSessionPocDraft(
+        sessionId,
+        {
+          ...pocDraft,
+          title: resolvedTitle,
+          aiStudioLink: resolvedAiStudioLink,
+        },
+        {
+          ...notification,
+          email: email || null,
+          notifiedAt: new Date().toISOString(),
+        }
+      );
+
+      res.json({ success: true, notification });
+    } catch (error) {
+      console.error("POC notify error:", error);
+      res.status(500).json({ error: "Failed to send POC notification" });
+    }
+  }
+);
+
+router.get(
+  "/sessions/:sessionId/poc/export",
+  async (req: Request & { userId?: string }, res: Response): Promise<void> => {
+    try {
+      const userId = req.userId!;
+      const session = await getSession(sessionIdParam(req));
+      if (!session) {
+        res.status(404).json({ error: "Session not found" });
+        return;
+      }
+      if (session.userId && session.userId !== userId) {
+        res.status(403).json({ error: "Unauthorized" });
+        return;
+      }
+
+      const pocDraft = (session.pocDraft ?? null) as Record<string, unknown> | null;
+      if (!pocDraft) {
+        res.status(404).json({ error: "No POC draft available for this session" });
+        return;
+      }
+
+      const format = String(req.query.format ?? "json").toLowerCase();
+      const filenameBase = `poc-${session.id.slice(0, 8)}`;
+
+      if (format === "txt") {
+        const lines = [
+          `Title: ${String(pocDraft.title ?? "POC Build")}`,
+          `AI Studio: ${String(pocDraft.aiStudioLink ?? "https://aistudio.google.com/apps")}`,
+          `Generated At: ${String(pocDraft.generatedAt ?? new Date().toISOString())}`,
+          "",
+          "Summary:",
+          String(pocDraft.summary ?? ""),
+          "",
+          "Files:",
+        ];
+        const files = Array.isArray(pocDraft.files) ? pocDraft.files : [];
+        for (const f of files) {
+          if (!f || typeof f !== "object" || Array.isArray(f)) continue;
+          const path = String((f as Record<string, unknown>).path ?? "").trim();
+          if (path) lines.push(`- ${path}`);
+        }
+        const payload = lines.join("\n");
+        res.setHeader("Content-Type", "text/plain; charset=utf-8");
+        res.setHeader("Content-Disposition", `attachment; filename=\"${filenameBase}.txt\"`);
+        res.send(payload);
+        return;
+      }
+
+      res.setHeader("Content-Type", "application/json; charset=utf-8");
+      res.setHeader("Content-Disposition", `attachment; filename=\"${filenameBase}.json\"`);
+      res.send(JSON.stringify({
+        sessionId: session.id,
+        exportedAt: new Date().toISOString(),
+        pocDraft,
+      }, null, 2));
+    } catch (error) {
+      console.error("POC export error:", error);
+      res.status(500).json({ error: "Failed to export POC data" });
+    }
+  }
+);
+
+router.post(
+  "/sessions/:sessionId/poc/github",
+  async (req: Request & { userId?: string }, res: Response): Promise<void> => {
+    try {
+      const userId = req.userId!;
+      const sessionId = sessionIdParam(req);
+      const session = await getSession(sessionId);
+      if (!session) {
+        res.status(404).json({ error: "Session not found" });
+        return;
+      }
+      if (session.userId && session.userId !== userId) {
+        res.status(403).json({ error: "Unauthorized" });
+        return;
+      }
+
+      const {
+        githubToken,
+        repoName,
+        owner,
+        isPrivate,
+        description,
+      } = req.body as {
+        githubToken?: string;
+        repoName?: string;
+        owner?: string;
+        isPrivate?: boolean;
+        description?: string;
+      };
+
+      const token = String(githubToken ?? "").trim() || String(process.env.GITHUB_TOKEN ?? "").trim();
+      const pocDraft = (session.pocDraft ?? null) as Record<string, unknown> | null;
+      if (!pocDraft) {
+        res.status(400).json({ error: "No generated POC found for this session" });
+        return;
+      }
+      if (!token) {
+        res.status(400).json({ error: "githubToken is required" });
+        return;
+      }
+
+      const title = String(pocDraft.title ?? "Mirror Mind POC").trim() || "Mirror Mind POC";
+      const safeRepoName = String(repoName ?? title).trim();
+
+      const files = Array.isArray(pocDraft.files)
+        ? pocDraft.files
+            .filter((f) => f && typeof f === "object" && !Array.isArray(f))
+            .map((f) => {
+              const rec = f as Record<string, unknown>;
+              return {
+                path: String(rec.path ?? "").trim(),
+                content: String(rec.content ?? ""),
+              };
+            })
+            .filter((f) => f.path)
+        : [];
+
+      const result = await publishPocToGitHub({
+        token,
+        repoName: safeRepoName,
+        owner: String(owner ?? "").trim() || undefined,
+        isPrivate: Boolean(isPrivate),
+        description: String(description ?? "").trim() || undefined,
+        poc: {
+          title,
+          summary: String(pocDraft.summary ?? ""),
+          backendPlan: Array.isArray(pocDraft.backendPlan) ? pocDraft.backendPlan.map((x) => String(x)) : [],
+          frontendPlan: Array.isArray(pocDraft.frontendPlan) ? pocDraft.frontendPlan.map((x) => String(x)) : [],
+          nextSteps: Array.isArray(pocDraft.nextSteps) ? pocDraft.nextSteps.map((x) => String(x)) : [],
+          files,
+          idea: String(pocDraft.idea ?? ""),
+          techStack: parseTechStack(pocDraft.techStack),
+          aiStudioLink: String(pocDraft.aiStudioLink ?? ""),
+        },
+      });
+
+      await updateSessionPocDraft(
+        sessionId,
+        {
+          ...pocDraft,
+          github: {
+            ...result,
+            pushedAt: new Date().toISOString(),
+          },
+        },
+        session.pocNotification ?? null
+      );
+
+      res.json({ success: true, github: result });
+    } catch (error) {
+      console.error("POC GitHub publish error:", error);
+      res.status(500).json({
+        error: "Failed to publish POC to GitHub",
+        message: error instanceof Error ? error.message : "Unknown error",
+      });
     }
   }
 );
