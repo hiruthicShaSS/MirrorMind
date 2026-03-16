@@ -4,6 +4,7 @@ import {
   createSession,
   getSession,
   appendMessage,
+  getUserProfile,
   updateConceptMap,
   updateFeasibilitySignal,
   closeSession,
@@ -212,6 +213,89 @@ function deriveReferenceLinks(seedText: string, explicitLinks: string[]): string
   return matches.slice(0, 3);
 }
 
+function inferTechStackFromText(text: string, limit = 6): string[] {
+  const lowered = text.toLowerCase();
+  const triggerSplit = text
+    .split(/[,/]| and | with | using /i)
+    .map((part) => part.trim())
+    .filter((part) => part.length > 1);
+  const candidates = triggerSplit
+    .map((part) => part.replace(/[^a-zA-Z0-9.+#_-]/g, " ").trim())
+    .filter(Boolean);
+  return candidates.slice(0, limit);
+}
+
+function detectProductType(text: string): string | null {
+  const lowered = text.toLowerCase();
+  const types = ["web", "mobile", "desktop", "cli", "api", "service", "chrome extension", "slack app"];
+  for (const t of types) {
+    const pattern = new RegExp(`\\b${t.replace(" ", "\\s+")}\\b`, "i");
+    if (pattern.test(lowered)) return t;
+  }
+  return null;
+}
+
+function detectTargetAudience(text: string): string | null {
+  const match = text.match(/\bfor\s+([A-Za-z0-9 ,.&-]{3,80})/i);
+  if (match && match[1]) {
+    return match[1].trim();
+  }
+  const explicit = text.match(/\btarget (audience|users?)[:\s]+([\w ,.&-]{3,80})/i);
+  if (explicit && explicit[2]) return explicit[2].trim();
+  return null;
+}
+
+function detectUiStyle(text: string): string | null {
+  const uiMatch = text.match(/\b(ui|design|look|feel|theme|style)\b[:\s-]*([\w ,.&-]{3,80})/i);
+  if (uiMatch && uiMatch[2]) return uiMatch[2].trim();
+  return null;
+}
+
+function formatPocConclusion(opts: {
+  idea: string;
+  stack: string[];
+  target?: string | null;
+  productType?: string | null;
+}): string {
+  const trimmedIdea = opts.idea.length > 120 ? `${opts.idea.slice(0, 117)}...` : opts.idea;
+  const stackLabel = opts.stack.length ? opts.stack.join(", ") : "the chosen stack";
+  const audience = opts.target?.trim() || "your users";
+  const product = opts.productType?.trim() || "product";
+  return `Understood! I'll proceed with the POC for ${trimmedIdea || "this idea"}, using ${stackLabel}, tailored for ${audience} as a ${product}.`;
+}
+
+const GENERATE_PROMPT = "Shall I generate the POC now?";
+
+function pocEventPayload(
+  poc: Record<string, unknown>,
+  prUrl: string | null = null
+): Record<string, unknown> {
+  const files = Array.isArray(poc.files) ? (poc.files as unknown[]) : [];
+  const safeFiles = files
+    .map((f) => {
+      if (!f || typeof f !== "object") return null;
+      const rec = f as Record<string, unknown>;
+      const path = String(rec.path ?? "").trim();
+      const content = String(rec.content ?? "").trim();
+      if (!path || !content) return null;
+      return { path, content };
+    })
+    .filter(Boolean);
+
+  return {
+    title: String(poc.title ?? "POC Build"),
+    summary: String(poc.summary ?? ""),
+    techStack: Array.isArray(poc.techStack) ? poc.techStack : [],
+    targetUsers: poc.targetUsers ?? null,
+    productType: poc.productType ?? null,
+    uiStyle: poc.uiStyle ?? null,
+    files: safeFiles,
+    aiStudioLink: String(poc.aiStudioLink ?? ""),
+    referenceLinks: Array.isArray(poc.referenceLinks) ? poc.referenceLinks : [],
+    prUrl,
+  };
+}
+
 function resolveAiStudioLink(value: unknown): string {
   const explicit = String(value ?? "").trim();
   if (explicit) return explicit;
@@ -286,9 +370,315 @@ router.post(
 
       await appendMessage(sid, "user", userInput);
 
+      // Auto-POC intent handling before streaming.
+      const wantsPoc = /\b(build|create|generate)\s+(a\s+)?poc\b/i.test(userInput);
+      const inferredStack = inferTechStackFromText(userInput);
+      const lastAssistantMsg = session.messages?.[session.messages.length - 1];
+      const awaitingStack =
+        lastAssistantMsg?.role === "assistant" &&
+        /which tech stack should i use|what tech stack should i use/i.test(lastAssistantMsg.content ?? "");
+
+      const productTypeFromInput = detectProductType(userInput);
+      const targetAudienceFromInput = detectTargetAudience(userInput);
+      const uiStyleFromInput = detectUiStyle(userInput);
+
+      const pendingPoc = session.pocDraft && session.pocDraft.generatedBy === "auto-poc-pending"
+        ? (session.pocDraft as Record<string, unknown>)
+        : null;
+
+      const alreadyPromptedPoc =
+        session.pocDraft &&
+        session.pocDraft.generatedBy &&
+        session.pocDraft.generatedBy !== "auto-poc-pending";
+
+      const pendingStack = Array.isArray(pendingPoc?.techStack) ? (pendingPoc?.techStack as string[]) : [];
+      const pendingTarget = typeof pendingPoc?.targetUsers === "string" ? (pendingPoc?.targetUsers as string) : "";
+      const pendingProduct = typeof pendingPoc?.productType === "string" ? (pendingPoc?.productType as string) : "";
+      const pendingUi = typeof pendingPoc?.uiStyle === "string" ? (pendingPoc?.uiStyle as string) : "";
+
+      // Guided POC intake: ask for missing fields in order, then build and notify.
+      if ((wantsPoc || awaitingStack || pendingPoc) && !alreadyPromptedPoc) {
+        const ideaMessages = [...(session.messages ?? []), { role: "user", content: userInput }];
+        const normalizedIdea = String(extractLatestUserIdea(ideaMessages)).trim();
+        const stack = inferredStack.length ? inferredStack : pendingStack;
+        const target = targetAudienceFromInput || pendingTarget;
+        const productType = productTypeFromInput || pendingProduct;
+        const uiStyle = uiStyleFromInput || pendingUi;
+
+        const askStack = stack.length === 0;
+        const askTarget = !askStack && !target;
+        const askProduct = !askStack && !askTarget && !productType;
+
+        if (askStack) {
+          const prompt =
+            "I can build the POC. What tech stack should I use? (e.g., Next.js + Supabase). Then I'll ask target audience, UI style, and product type.";
+          await appendMessage(sid, "assistant", prompt);
+          res.setHeader("Content-Type", "application/x-ndjson");
+          res.setHeader("Cache-Control", "no-cache");
+          res.setHeader("Connection", "keep-alive");
+          res.write(JSON.stringify({ chunk: prompt }) + "\n");
+          res.write(JSON.stringify({ done: true }) + "\n");
+          res.end();
+          return;
+        }
+
+        if (askTarget) {
+          await updateSessionPocDraft(
+            sid,
+            {
+              generatedBy: "auto-poc-pending",
+              idea: normalizedIdea,
+              techStack: stack,
+            },
+            null
+          );
+          const prompt = "Great. Who is the target audience for this POC?";
+          await appendMessage(sid, "assistant", prompt);
+          res.setHeader("Content-Type", "application/x-ndjson");
+          res.setHeader("Cache-Control", "no-cache");
+          res.setHeader("Connection", "keep-alive");
+          res.write(JSON.stringify({ chunk: prompt }) + "\n");
+          res.write(JSON.stringify({ done: true }) + "\n");
+          res.end();
+          return;
+        }
+
+        if (askProduct) {
+          await updateSessionPocDraft(
+            sid,
+            {
+              generatedBy: "auto-poc-pending",
+              idea: normalizedIdea,
+              techStack: stack,
+              targetUsers: target,
+            },
+            null
+          );
+          const prompt = "What product type should this be (web/mobile/desktop/CLI)?";
+          await appendMessage(sid, "assistant", prompt);
+          res.setHeader("Content-Type", "application/x-ndjson");
+          res.setHeader("Cache-Control", "no-cache");
+          res.setHeader("Connection", "keep-alive");
+          res.write(JSON.stringify({ chunk: prompt }) + "\n");
+          res.write(JSON.stringify({ done: true }) + "\n");
+          res.end();
+          return;
+        }
+
+        // All required inputs gathered: build POC and notify.
+        try {
+          const userProfile = await getUserProfile(userId).catch(() => null);
+          const loginEmail = String(userProfile?.email ?? "").trim();
+          const normalizedAiStudioLink = resolveAiStudioLink(null);
+
+          const pocDraft = await buildPocDraft(
+            {
+              idea: normalizedIdea,
+              techStack: stack,
+              productType: productType ?? undefined,
+              targetUsers: target ?? undefined,
+            },
+            { userApiKey: undefined }
+          );
+
+          const title = String(pocDraft.title ?? "POC Build").trim() || "POC Build";
+          const referenceLinks = Array.isArray(req.body?.referenceLinks) ? parseStringList(req.body.referenceLinks) : [];
+
+          const stored = {
+            ...pocDraft,
+            title,
+            idea: normalizedIdea,
+            techStack: stack,
+            productType: productType ?? null,
+            targetUsers: target ?? null,
+            uiStyle: uiStyle ?? null,
+            referenceLinks,
+            aiStudioLink: normalizedAiStudioLink,
+            generatedAt: new Date().toISOString(),
+            generatedBy: "auto-poc-ready",
+          };
+
+          const summaryLine = formatPocConclusion({
+            idea: normalizedIdea,
+            stack,
+            target,
+            productType,
+          });
+
+          const reply = [
+            summaryLine,
+            uiStyle ? `UI style noted: ${uiStyle}.` : "",
+            `Title: ${title}`,
+            `Summary: ${String(pocDraft.summary ?? "")}`,
+            GENERATE_PROMPT,
+          ]
+            .filter(Boolean)
+            .join(" ");
+
+          await appendMessage(sid, "assistant", reply);
+          res.setHeader("Content-Type", "application/x-ndjson");
+          res.setHeader("Cache-Control", "no-cache");
+          res.setHeader("Connection", "keep-alive");
+          res.write(JSON.stringify({ chunk: reply }) + "\n");
+          res.write(JSON.stringify({ poc: pocEventPayload(stored, null), prompt: GENERATE_PROMPT }) + "\n");
+          res.write(JSON.stringify({ done: true }) + "\n");
+          res.end();
+          return;
+        } catch (autoErr) {
+          console.error("Auto POC build failed:", autoErr);
+          // fall through to normal streaming on failure
+        }
+      }
+
       res.setHeader("Content-Type", "application/x-ndjson");
       res.setHeader("Cache-Control", "no-cache");
       res.setHeader("Connection", "keep-alive");
+
+      // Refinement: if we already have an auto POC and the user provides more details, rebuild and optionally open a PR.
+      const hasAutoPoc = session.pocDraft && session.pocDraft.generatedBy === "auto-poc";
+      const newStack = inferredStack.length ? inferredStack : null;
+      const newProductType = productTypeFromInput;
+      const newTargetUsers = targetAudienceFromInput;
+      const newUiStyle = uiStyleFromInput;
+
+      if (hasAutoPoc && (newStack || newProductType || newTargetUsers || newUiStyle)) {
+        try {
+          const existing = session.pocDraft as Record<string, unknown>;
+          const idea = String(existing.idea ?? extractLatestUserIdea(session.messages ?? []) ?? "").trim();
+          const stack = newStack ?? (Array.isArray(existing.techStack) ? (existing.techStack as string[]) : []);
+          if (!stack.length) {
+            const prompt =
+              "I can rebuild the POC, but I still need the tech stack (e.g., Next.js + Supabase).";
+            await appendMessage(sid, "assistant", prompt);
+            res.write(JSON.stringify({ chunk: prompt }) + "\n");
+            res.write(JSON.stringify({ done: true }) + "\n");
+            res.end();
+            return;
+          }
+
+          const productType = newProductType ?? (existing.productType as string | null) ?? undefined;
+          const targetUsers = newTargetUsers ?? (existing.targetUsers as string | null) ?? undefined;
+          const uiStyle = newUiStyle ?? (existing.uiStyle as string | null) ?? null;
+          const ideaWithUi = uiStyle ? `${idea}\nPreferred UI style: ${uiStyle}` : idea;
+
+          const pocDraft = await buildPocDraft(
+            {
+              idea: ideaWithUi,
+              techStack: stack,
+              productType: productType || undefined,
+              targetUsers: targetUsers || undefined,
+            },
+            { userApiKey: undefined }
+          );
+
+          const title = String(pocDraft.title ?? "POC Build").trim() || "POC Build";
+          const referenceLinks = Array.isArray(req.body?.referenceLinks) ? parseStringList(req.body.referenceLinks) : [];
+          const userProfile = await getUserProfile(userId).catch(() => null);
+          const normalizedEmail = String(userProfile?.email ?? "").trim();
+
+          const storedPocDraft = {
+            ...pocDraft,
+            title,
+            idea,
+            techStack: stack,
+            productType: productType ?? null,
+            targetUsers: targetUsers ?? null,
+            uiStyle,
+            referenceLinks,
+            aiStudioLink: resolveAiStudioLink(null),
+            generatedAt: new Date().toISOString(),
+            generatedBy: "auto-poc-refine",
+          };
+
+          let prUrl: string | undefined;
+          const github = await getGitHubConnection(userId);
+          if (github?.accessToken && github.defaultOwner && github.defaultRepo) {
+          const pr = await publishPocAsPullRequest({
+            token: github.accessToken,
+            owner: github.defaultOwner,
+            repo: github.defaultRepo,
+            prTitle: `POC: ${title}`,
+            prBody: [
+              String(pocDraft.summary ?? "").trim(),
+              "",
+              targetUsers ? `Target audience: ${targetUsers}` : "",
+              stack.length ? `Tech stack: ${stack.join(", ")}` : "",
+              productType ? `Product type: ${productType}` : "",
+              uiStyle ? `UI style: ${uiStyle}` : "",
+            ]
+              .filter(Boolean)
+              .join("\n"),
+            poc: {
+              title,
+              summary: String(pocDraft.summary ?? ""),
+              backendPlan: pocDraft.backendPlan,
+              frontendPlan: pocDraft.frontendPlan,
+              nextSteps: pocDraft.nextSteps,
+              files: pocDraft.files,
+              idea,
+              techStack: stack,
+              aiStudioLink: resolveAiStudioLink(null),
+              },
+            });
+            prUrl = pr.prUrl;
+          }
+
+          await updateSessionPocDraft(
+            sid,
+            {
+              ...storedPocDraft,
+              github: prUrl
+                ? {
+                    owner: github!.defaultOwner!,
+                    repo: github!.defaultRepo!,
+                    baseBranch: "main",
+                    branch: "auto-poc",
+                    prUrl,
+                    prTitle: `POC: ${title}`,
+                    pushedAt: new Date().toISOString(),
+                  }
+                : existing.github ?? null,
+            },
+            session.pocNotification ?? null
+          );
+
+          await notifyPocReady({
+            sessionId: sid,
+            title,
+            aiStudioLink: resolveAiStudioLink(null),
+            idea,
+            recipientEmail: normalizedEmail || undefined,
+            userId,
+            techStack: stack,
+            futureChanges: [],
+            referenceLinks,
+            prUrl,
+          }).catch((e: Error) => console.warn("Auto POC refine notification skipped:", e.message));
+
+          const reply = [
+            formatPocConclusion({
+              idea,
+              stack,
+              target: targetUsers,
+              productType,
+            }),
+            uiStyle ? `UI style noted: ${uiStyle}.` : "",
+            prUrl ? `Opened PR: ${prUrl}` : "No PR opened (connect GitHub with a default repo to auto-open).",
+          ]
+            .filter(Boolean)
+            .join(" ");
+
+          await appendMessage(sid, "assistant", reply);
+          res.write(JSON.stringify({ chunk: reply }) + "\n");
+          res.write(JSON.stringify({ poc: pocEventPayload(storedPocDraft, prUrl ?? null) }) + "\n");
+          res.write(JSON.stringify({ done: true }) + "\n");
+          res.end();
+          return;
+        } catch (refineErr) {
+          console.error("Auto POC refine failed:", refineErr);
+          // continue to normal streaming on failure
+        }
+      }
 
       let fullResponse = "";
 
@@ -568,7 +958,10 @@ router.post(
       const normalizedTargetUsers = String(targetAudience ?? targetUsers ?? "").trim();
       const normalizedFutureChanges = parseStringList(futureChanges);
       const normalizedReferenceLinks = parseStringList(referenceLinks);
-      const normalizedEmail = String(notificationEmail ?? "").trim();
+      const userProfile = await getUserProfile(userId).catch(() => null);
+      const loginEmail = String(userProfile?.email ?? "").trim();
+      const extraEmail = String(notificationEmail ?? "").trim();
+      const allEmails = [loginEmail, extraEmail].filter(Boolean);
       const normalizedAiStudioLink = resolveAiStudioLink(aiStudioLink);
       const normalizedAiStudioApiKey = String(aiStudioApiKey ?? "").trim();
 
@@ -594,10 +987,12 @@ router.post(
         userApiKey: normalizedAiStudioApiKey || undefined,
       });
       const title = String(pocDraft.title ?? "POC Build").trim() || "POC Build";
-      const resolvedReferenceLinks = deriveReferenceLinks(
-        `${title}\n${normalizedIdea}\n${String(pocDraft.summary ?? "")}`,
-        normalizedReferenceLinks
-      );
+      const resolvedReferenceLinks = normalizedReferenceLinks.length
+        ? normalizedReferenceLinks
+        : deriveReferenceLinks(
+            `${title}\n${normalizedIdea}\n${String(pocDraft.summary ?? "")}`,
+            normalizedReferenceLinks
+          );
       const storedPocDraft = {
         ...pocDraft,
         title,
@@ -670,24 +1065,37 @@ router.post(
           "POC generated, but no GitHub PR was created because no connected GitHub repo target is configured.";
       }
 
-      await appendMessage(
-        sessionId,
-        "assistant",
-        `POC generated for stack: ${normalizedTechStack.join(", ")}\n${pocDraft.summary}\nAI Studio: ${normalizedAiStudioLink}`
-      );
-
-      const notification = await notifyPocReady({
-        sessionId,
-        title,
-        aiStudioLink: normalizedAiStudioLink,
+      const conclusion = formatPocConclusion({
         idea: normalizedIdea,
-        recipientEmail: normalizedEmail || undefined,
-        userId,
-        techStack: normalizedTechStack,
-        prUrl: githubResult?.prUrl,
-        futureChanges: normalizedFutureChanges,
-        referenceLinks: resolvedReferenceLinks,
+        stack: normalizedTechStack,
+        target: normalizedTargetUsers,
+        productType: String(productType ?? "").trim() || null,
       });
+      const assistantMsg = [
+        conclusion,
+        `Summary: ${String(pocDraft.summary ?? "")}`,
+        `AI Studio: ${normalizedAiStudioLink}`,
+      ]
+        .filter(Boolean)
+        .join("\n");
+      await appendMessage(sessionId, "assistant", assistantMsg);
+
+      const notification = await Promise.all(
+        (allEmails.length ? allEmails : [undefined]).map((email) =>
+          notifyPocReady({
+            sessionId,
+            title,
+            aiStudioLink: normalizedAiStudioLink,
+            idea: normalizedIdea,
+            recipientEmail: email || undefined,
+            userId,
+            techStack: normalizedTechStack,
+            prUrl: githubResult?.prUrl,
+            futureChanges: normalizedFutureChanges,
+            referenceLinks: resolvedReferenceLinks,
+          })
+        )
+      ).then((arr) => arr[0]);
 
       if (process.env.NOTION_API_KEY && process.env.NOTION_DATABASE_ID) {
         await syncSessionToNotion({
@@ -733,7 +1141,7 @@ router.post(
         },
         {
           ...notification,
-          email: normalizedEmail || null,
+          email: loginEmail || null,
           notifiedAt: new Date().toISOString(),
         }
       );
@@ -812,7 +1220,10 @@ router.post(
       const normalizedReferenceLinks = parseStringList(referenceLinks);
       const normalizedIdea = String(extractLatestUserIdea(session.messages ?? [])).trim();
       const normalizedAiStudioApiKey = String(aiStudioApiKey ?? "").trim();
-      const normalizedEmail = String(notificationEmail ?? "").trim();
+      const userProfile = await getUserProfile(userId).catch(() => null);
+      const loginEmail = String(userProfile?.email ?? "").trim();
+      const extraEmail = String(notificationEmail ?? "").trim();
+      const allEmails = [loginEmail, extraEmail].filter(Boolean);
       const normalizedAiStudioLink = resolveAiStudioLink(aiStudioLink);
 
       if (!normalizedIdea) {
@@ -907,18 +1318,22 @@ router.post(
         },
       });
 
-      const notification = await notifyPocReady({
-        sessionId,
-        title: pr.prTitle,
-        aiStudioLink: normalizedAiStudioLink,
-        idea: normalizedIdea,
-        recipientEmail: normalizedEmail || undefined,
-        userId,
-        techStack: normalizedTechStack,
-        prUrl: pr.prUrl,
-        futureChanges: normalizedFutureChanges,
-        referenceLinks: resolvedReferenceLinks,
-      });
+      const notification = await Promise.all(
+        (allEmails.length ? allEmails : [undefined]).map((email) =>
+          notifyPocReady({
+            sessionId,
+            title: pr.prTitle,
+            aiStudioLink: normalizedAiStudioLink,
+            idea: normalizedIdea,
+            recipientEmail: email || undefined,
+            userId,
+            techStack: normalizedTechStack,
+            prUrl: pr.prUrl,
+            futureChanges: normalizedFutureChanges,
+            referenceLinks: resolvedReferenceLinks,
+          })
+        )
+      ).then((arr) => arr[0]);
 
       if (process.env.NOTION_API_KEY && process.env.NOTION_DATABASE_ID) {
         await syncSessionToNotion({
@@ -953,7 +1368,7 @@ router.post(
         },
         {
           ...notification,
-          email: normalizedEmail || null,
+          email: loginEmail || null,
           notifiedAt: new Date().toISOString(),
         }
       );

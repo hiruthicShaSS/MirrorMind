@@ -88,6 +88,55 @@ function parseFiles(value: unknown): PocFile[] {
   return out;
 }
 
+function ensurePackageJson(result: PocBuildResult, techStack: string[]): PocBuildResult {
+  const alreadyHasPackageJson = result.files.some((f) => f.path.toLowerCase() === "package.json");
+  if (alreadyHasPackageJson) return result;
+
+  const stack = techStack.map((s) => s.toLowerCase());
+  const isNext = stack.some((s) => s.includes("next"));
+  const isReact = stack.some((s) => s.includes("react"));
+  const isNode = stack.some((s) => s.includes("node") || s.includes("express"));
+
+  const pkg: Record<string, unknown> = {
+    name: "poc-app",
+    version: "0.1.0",
+    private: true,
+    scripts: {
+      dev: isNext ? "next dev" : "tsx src/index.ts",
+      build: isNext ? "next build" : "tsc -b",
+      start: isNext ? "next start" : "node dist/index.js",
+    },
+    dependencies: {},
+    devDependencies: {},
+  };
+
+  const deps = pkg.dependencies as Record<string, string>;
+  const devDeps = pkg.devDependencies as Record<string, string>;
+
+  if (isNext || isReact) {
+    deps["next"] = deps["next"] ?? "14.2.10";
+    deps["react"] = deps["react"] ?? "18.3.1";
+    deps["react-dom"] = deps["react-dom"] ?? "18.3.1";
+    devDeps["@types/react"] = devDeps["@types/react"] ?? "18.3.4";
+    devDeps["@types/react-dom"] = devDeps["@types/react-dom"] ?? "18.3.0";
+  }
+
+  if (isNode) {
+    deps["express"] = deps["express"] ?? "4.19.2";
+    deps["cors"] = deps["cors"] ?? "2.8.5";
+  }
+
+  devDeps["typescript"] = devDeps["typescript"] ?? "5.4.5";
+  devDeps["tsx"] = devDeps["tsx"] ?? "4.7.1";
+
+  const pkgFile: PocFile = {
+    path: "package.json",
+    content: JSON.stringify(pkg, null, 2),
+  };
+
+  return { ...result, files: [...result.files, pkgFile] };
+}
+
 function fallbackPoc(req: PocBuildRequest): PocBuildResult {
   const stack = normalizeStack(req.techStack);
   const stackLabel = stack.length ? stack.join(", ") : "Node.js, React, Firebase";
@@ -235,5 +284,6 @@ export async function buildPocDraft(
   const keyFromUser = String(options?.userApiKey ?? "").trim();
   const userClient = keyFromUser ? new GoogleGenerativeAI(keyFromUser) : null;
   const generated = await generateWithGeminiUsingClient(normalizedReq, userClient ?? client);
-  return generated ?? fallbackPoc(normalizedReq);
+  const base = generated ?? fallbackPoc(normalizedReq);
+  return ensurePackageJson(base, normalizedReq.techStack);
 }
