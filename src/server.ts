@@ -18,6 +18,7 @@ const app = express();
 const defaultProdOrigins = [
   "https://mirror-mind.hiruthicsha.com",
   "https://mirrormind-production.up.railway.app",
+  "https://mirror-mind-665021373718.us-central1.run.app"
 ];
 
 const envOrigins = (process.env.FRONTEND_URL ??
