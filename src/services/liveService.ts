@@ -17,10 +17,11 @@ const ai = apiKey ? new GoogleGenAI({ apiKey }) : null;
 const LIVE_MODELS = process.env.GEMINI_LIVE_MODEL
   ? [process.env.GEMINI_LIVE_MODEL]
   : [
+      // Google AI (Developer API) native-audio models; prefer newest preview first.
       "gemini-2.5-flash-native-audio-preview-12-2025",
-      "gemini-live-2.5-flash-preview-native-audio-09-2025",
-      "gemini-live-2.5-flash-native-audio",
-      "gemini-live-2.5-flash-preview-native-audio",
+      "gemini-2.5-flash-native-audio-preview-09-2025",
+      // GA fallback (audio + text) without the deprecated "gemini-live-*" Vertex names.
+      "gemini-2.5-flash-native-audio",
     ];
 
 let lastTriedModelIndex = -1;
