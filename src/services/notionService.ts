@@ -23,6 +23,11 @@ export interface SyncSessionData {
   conceptMap?: Record<string, string[]>;
   feasibilitySignal?: number | null;
   tags?: { name: string }[];
+  pocTitle?: string;
+  pocSummary?: string;
+  futureChanges?: string[];
+  referenceLinks?: string[];
+  githubPrUrl?: string;
 }
 
 function toMermaidConceptMap(conceptMap: Record<string, string[]>): string {
@@ -73,6 +78,11 @@ export async function syncSessionToNotion(sessionData: SyncSessionData): Promise
   const conceptMap = sessionData.conceptMap ?? {};
   const feasibilitySignal = sessionData.feasibilitySignal;
   const tags = sessionData.tags ?? [];
+  const pocTitle = (sessionData.pocTitle ?? "").trim();
+  const pocSummary = (sessionData.pocSummary ?? "").trim();
+  const futureChanges = (sessionData.futureChanges ?? []).map((item) => String(item).trim()).filter(Boolean);
+  const referenceLinks = (sessionData.referenceLinks ?? []).map((item) => String(item).trim()).filter(Boolean);
+  const githubPrUrl = (sessionData.githubPrUrl ?? "").trim();
 
   const feasibilityPercent =
     typeof feasibilitySignal === "number" ? Math.round(feasibilitySignal * 100) : null;
@@ -185,6 +195,68 @@ export async function syncSessionToNotion(sessionData: SyncSessionData): Promise
       ],
     },
   });
+
+  if (pocTitle || pocSummary || githubPrUrl || futureChanges.length || referenceLinks.length) {
+    children.push({
+      object: "block",
+      type: "heading_2",
+      heading_2: { rich_text: [{ text: { content: "6) POC delivery" } }] },
+    });
+
+    if (pocTitle) {
+      children.push({
+        object: "block",
+        type: "paragraph",
+        paragraph: { rich_text: toRichText(`POC title: ${pocTitle}`) },
+      });
+    }
+
+    if (pocSummary) {
+      children.push({
+        object: "block",
+        type: "paragraph",
+        paragraph: { rich_text: toRichText(`POC summary: ${pocSummary}`) },
+      });
+    }
+
+    if (githubPrUrl) {
+      children.push({
+        object: "block",
+        type: "paragraph",
+        paragraph: { rich_text: toRichText(`GitHub PR: ${githubPrUrl}`) },
+      });
+    }
+
+    if (futureChanges.length) {
+      children.push({
+        object: "block",
+        type: "heading_3",
+        heading_3: { rich_text: [{ text: { content: "Future changes required" } }] },
+      });
+      for (const item of futureChanges) {
+        children.push({
+          object: "block",
+          type: "bulleted_list_item",
+          bulleted_list_item: { rich_text: toRichText(item) },
+        });
+      }
+    }
+
+    if (referenceLinks.length) {
+      children.push({
+        object: "block",
+        type: "heading_3",
+        heading_3: { rich_text: [{ text: { content: "Reference apps" } }] },
+      });
+      for (const link of referenceLinks) {
+        children.push({
+          object: "block",
+          type: "bulleted_list_item",
+          bulleted_list_item: { rich_text: toRichText(link) },
+        });
+      }
+    }
+  }
 
   const titlePropName = process.env.NOTION_TITLE_PROPERTY ?? "Name";
   const properties: Record<string, unknown> = {
