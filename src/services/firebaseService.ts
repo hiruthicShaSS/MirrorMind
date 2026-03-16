@@ -376,13 +376,15 @@ export async function getUserSessions(userId: string, limit = 10): Promise<Forma
     return sessions.slice(0, limit);
   }
   try {
+    // Use an index-free query (no orderBy) and sort in-memory to avoid composite-index requirements.
     const snapshot = await (database as admin.firestore.Firestore)
       .collection("sessions")
       .where("userId", "==", userId)
-      .orderBy("createdAt", "desc")
-      .limit(limit)
+      .limit(limit * 2) // over-fetch a bit to ensure we have enough after sorting
       .get();
-    return snapshot.docs.map((doc) => formatSessionResponse(doc.data() as unknown as SessionData));
+    const sessions = snapshot.docs.map((doc) => formatSessionResponse(doc.data() as unknown as SessionData));
+    sessions.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+    return sessions.slice(0, limit);
   } catch (error) {
     // Fallback path for missing index or query constraints: scan recent sessions and filter in memory.
     console.warn("getUserSessions query fallback:", error instanceof Error ? error.message : String(error));
@@ -412,30 +414,20 @@ export async function getAllUserSessions(userId: string, batchSize = 200): Promi
     return sessions;
   }
 
-  const out: FormattedSession[] = [];
-  let cursor: admin.firestore.QueryDocumentSnapshot | null = null;
-
   try {
-    while (true) {
-      let query = (database as admin.firestore.Firestore)
-        .collection("sessions")
-        .where("userId", "==", userId)
-        .orderBy("createdAt", "asc")
-        .limit(batchSize);
-
-      if (cursor) query = query.startAfter(cursor);
-
-      const snapshot = await query.get();
-      if (snapshot.empty) break;
-      out.push(...snapshot.docs.map((doc) => formatSessionResponse(doc.data() as unknown as SessionData)));
-      cursor = snapshot.docs[snapshot.docs.length - 1] ?? null;
-      if (snapshot.size < batchSize) break;
-    }
+    // Index-free fetch: equality filter only, then sort in-memory to avoid composite index requirements.
+    const snapshot = await (database as admin.firestore.Firestore)
+      .collection("sessions")
+      .where("userId", "==", userId)
+      .get();
+    const out = snapshot.docs.map((doc) => formatSessionResponse(doc.data() as unknown as SessionData));
+    out.sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+    return out;
   } catch (error) {
     // Fallback path for missing composite index: fetch batches ordered by createdAt and filter user in memory.
     console.warn("getAllUserSessions query fallback:", error instanceof Error ? error.message : String(error));
-    out.length = 0;
-    cursor = null;
+    const out: FormattedSession[] = [];
+    let cursor: admin.firestore.QueryDocumentSnapshot | null = null;
     while (true) {
       let query = (database as admin.firestore.Firestore)
         .collection("sessions")
@@ -452,9 +444,8 @@ export async function getAllUserSessions(userId: string, batchSize = 200): Promi
       cursor = snapshot.docs[snapshot.docs.length - 1] ?? null;
       if (snapshot.size < batchSize) break;
     }
+    return out;
   }
-
-  return out;
 }
 
 export async function getUserProfile(userId: string): Promise<UserProfileRecord | null> {
